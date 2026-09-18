@@ -17,7 +17,7 @@ final class ScreenAwakeController {
         #elseif os(macOS)
         if shouldStayAwake, activity == nil {
             activity = ProcessInfo.processInfo.beginActivity(
-                options: [.idleSystemSleepDisabled, .userInitiated],
+                options: [.idleSystemSleepDisabled, .idleDisplaySleepDisabled, .userInitiated],
                 reason: "Displaying an active show document"
             )
         } else if !shouldStayAwake, let activity {

@@ -29,22 +29,40 @@ struct ShowDocument: Codable, Identifiable, Equatable, Sendable {
 @MainActor
 @Observable
 final class ViewerModel {
+    @ObservationIgnored private let defaults: UserDefaults
+    @ObservationIgnored private let storageDirectory: URL?
+    @ObservationIgnored private var pendingPersistenceTask: Task<Void, Never>?
+
     private(set) var document: PDFDocument?
     private(set) var activeDocumentID: ShowDocument.ID?
     private(set) var currentPageIndex = 0
     private(set) var documents: [ShowDocument] = []
     private(set) var presentedError: String?
+    private(set) var libraryNeedsRecovery = false
+    private(set) var libraryRecoveryURL: URL?
 
     var startupBehavior: StartupBehavior {
         didSet {
-            UserDefaults.standard.set(startupBehavior.rawValue, forKey: Keys.startupBehavior)
+            defaults.set(startupBehavior.rawValue, forKey: Keys.startupBehavior)
         }
     }
 
     var keepScreenAwake: Bool {
         didSet {
-            UserDefaults.standard.set(keepScreenAwake, forKey: Keys.keepScreenAwake)
+            defaults.set(keepScreenAwake, forKey: Keys.keepScreenAwake)
         }
+    }
+
+    var invertPDFColors: Bool {
+        didSet { defaults.set(invertPDFColors, forKey: "invertPDFColors") }
+    }
+
+    var invertAnnotations: Bool {
+        didSet { defaults.set(invertAnnotations, forKey: "invertAnnotations") }
+    }
+
+    var edgeTapNavigationEnabled: Bool {
+        didSet { defaults.set(edgeTapNavigationEnabled, forKey: Keys.edgeTapNavigationEnabled) }
     }
 
     var pageCount: Int {
@@ -68,22 +86,37 @@ final class ViewerModel {
         return documents.first { $0.id == activeDocumentID }
     }
 
-    init() {
-        let savedBehavior = UserDefaults.standard.string(forKey: Keys.startupBehavior)
+    init(defaults: UserDefaults = .standard, storageDirectory: URL? = nil) {
+        self.defaults = defaults
+        self.storageDirectory = storageDirectory
+        let savedBehavior = defaults.string(forKey: Keys.startupBehavior)
         startupBehavior = StartupBehavior(rawValue: savedBehavior ?? "") ?? .resumeLastPage
 
-        if UserDefaults.standard.object(forKey: Keys.keepScreenAwake) == nil {
+        if defaults.object(forKey: Keys.keepScreenAwake) == nil {
             keepScreenAwake = true
         } else {
-            keepScreenAwake = UserDefaults.standard.bool(forKey: Keys.keepScreenAwake)
+            keepScreenAwake = defaults.bool(forKey: Keys.keepScreenAwake)
+        }
+
+        invertPDFColors = defaults.bool(forKey: "invertPDFColors")
+        invertAnnotations = defaults.bool(forKey: "invertAnnotations")
+        if defaults.object(forKey: Keys.edgeTapNavigationEnabled) == nil {
+            edgeTapNavigationEnabled = true
+        } else {
+            edgeTapNavigationEnabled = defaults.bool(forKey: Keys.edgeTapNavigationEnabled)
         }
 
         loadLibrary()
         restoreLastDocument()
     }
 
+    deinit {
+        pendingPersistenceTask?.cancel()
+    }
+
     func perform(_ action: ViewtifulAction) {
         guard pageCount > 0 else { return }
+        let previousPageIndex = currentPageIndex
 
         switch action {
         case .nextPage:
@@ -99,11 +132,17 @@ final class ViewerModel {
             currentPageIndex = pageCount - 1
         }
 
+        guard currentPageIndex != previousPageIndex else { return }
         persistCurrentPage()
     }
 
     func importDocument(from sourceURL: URL) {
         presentedError = nil
+        guard !libraryNeedsRecovery else {
+            presentedError = libraryRecoveryMessage
+            return
+        }
+        cancelPendingPersistence()
         let hasAccess = sourceURL.startAccessingSecurityScopedResource()
         defer {
             if hasAccess {
@@ -119,7 +158,7 @@ final class ViewerModel {
 
             try FileManager.default.copyItem(at: sourceURL, to: destinationURL)
 
-            guard let loadedDocument = PDFDocument(url: destinationURL), loadedDocument.pageCount > 0 else {
+            guard let loadedDocument = PDFDocument(url: destinationURL), !loadedDocument.isLocked, loadedDocument.pageCount > 0 else {
                 try? FileManager.default.removeItem(at: destinationURL)
                 throw ViewerError.invalidPDF
             }
@@ -133,8 +172,6 @@ final class ViewerModel {
                 lastOpened: .now
             )
             documents.append(record)
-            sortLibrary()
-            saveLibrary()
             open(record, loadedDocument: loadedDocument)
         } catch {
             presentedError = "The selected PDF could not be imported."
@@ -142,6 +179,7 @@ final class ViewerModel {
     }
 
     func selectDocument(_ document: ShowDocument) {
+        cancelPendingPersistence()
         do {
             try openDocument(document)
         } catch {
@@ -150,6 +188,7 @@ final class ViewerModel {
     }
 
     func removeDocument(_ documentToRemove: ShowDocument) {
+        cancelPendingPersistence()
         let wasActive = activeDocumentID == documentToRemove.id
 
         do {
@@ -165,14 +204,42 @@ final class ViewerModel {
                 document = nil
                 activeDocumentID = nil
                 currentPageIndex = 0
-                UserDefaults.standard.removeObject(forKey: Keys.lastDocumentID)
+                defaults.removeObject(forKey: Keys.lastDocumentID)
             }
         } catch {
             presentedError = "The document could not be removed."
         }
     }
 
+    func reportImportError(_ error: Error) {
+        guard (error as NSError).code != NSUserCancelledError else { return }
+        presentedError = "The PDF could not be imported. \(error.localizedDescription)"
+    }
+
     func clearPresentedError() {
+        presentedError = nil
+    }
+
+    /// Writes the latest page position immediately. Call this at lifecycle
+    /// boundaries where queued persistence must be complete before suspension.
+    func flushPendingPersistence() {
+        cancelPendingPersistence()
+        saveLibrary()
+    }
+
+    func startNewLibrary() {
+        guard libraryNeedsRecovery else { return }
+        guard libraryRecoveryURL != nil else {
+            presentedError = "Viewtiful could not preserve the damaged document library, so it cannot safely create a new one."
+            return
+        }
+
+        documents = []
+        libraryNeedsRecovery = false
+        guard saveLibrary() else {
+            libraryNeedsRecovery = true
+            return
+        }
         presentedError = nil
     }
 
@@ -181,7 +248,7 @@ final class ViewerModel {
         guard
             FileManager.default.fileExists(atPath: documentURL.path),
             let loadedDocument = PDFDocument(url: documentURL),
-            loadedDocument.pageCount > 0
+            !loadedDocument.isLocked, loadedDocument.pageCount > 0
         else {
             throw ViewerError.invalidPDF
         }
@@ -190,6 +257,7 @@ final class ViewerModel {
     }
 
     private func open(_ record: ShowDocument, loadedDocument: PDFDocument) {
+        cancelPendingPersistence()
         document = loadedDocument
         activeDocumentID = record.id
 
@@ -200,14 +268,14 @@ final class ViewerModel {
             $0.lastOpened = .now
             $0.lastPageIndex = currentPageIndex
         }
-        UserDefaults.standard.set(record.id.uuidString, forKey: Keys.lastDocumentID)
+        defaults.set(record.id.uuidString, forKey: Keys.lastDocumentID)
         sortLibrary()
         saveLibrary()
     }
 
     private func restoreLastDocument() {
         guard
-            let idString = UserDefaults.standard.string(forKey: Keys.lastDocumentID),
+            let idString = defaults.string(forKey: Keys.lastDocumentID),
             let id = UUID(uuidString: idString),
             let record = documents.first(where: { $0.id == id })
         else {
@@ -217,7 +285,7 @@ final class ViewerModel {
         do {
             try openDocument(record)
         } catch {
-            UserDefaults.standard.removeObject(forKey: Keys.lastDocumentID)
+            defaults.removeObject(forKey: Keys.lastDocumentID)
         }
     }
 
@@ -226,7 +294,18 @@ final class ViewerModel {
         updateRecord(activeDocumentID) {
             $0.lastPageIndex = currentPageIndex
         }
-        saveLibrary()
+        pendingPersistenceTask?.cancel()
+        pendingPersistenceTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(150))
+            guard !Task.isCancelled, let self else { return }
+            self.saveLibrary()
+            self.pendingPersistenceTask = nil
+        }
+    }
+
+    private func cancelPendingPersistence() {
+        pendingPersistenceTask?.cancel()
+        pendingPersistenceTask = nil
     }
 
     private func updateRecord(_ id: ShowDocument.ID, update: (inout ShowDocument) -> Void) {
@@ -235,8 +314,15 @@ final class ViewerModel {
     }
 
     private func loadLibrary() {
+        let libraryFileURL: URL
         do {
-            let data = try Data(contentsOf: libraryURL())
+            libraryFileURL = try libraryURL()
+            guard FileManager.default.fileExists(atPath: libraryFileURL.path) else {
+                documents = []
+                return
+            }
+
+            let data = try Data(contentsOf: libraryFileURL)
             documents = try JSONDecoder().decode([ShowDocument].self, from: data)
             documents.removeAll { record in
                 guard let recordURL = try? url(for: record) else { return true }
@@ -246,15 +332,40 @@ final class ViewerModel {
             saveLibrary()
         } catch {
             documents = []
+            libraryNeedsRecovery = true
+            libraryRecoveryURL = preserveDamagedLibrary(at: (try? libraryURL()))
+            presentedError = libraryRecoveryMessage
         }
     }
 
-    private func saveLibrary() {
+    @discardableResult
+    private func saveLibrary() -> Bool {
         do {
             let data = try JSONEncoder().encode(documents)
             try data.write(to: libraryURL(), options: .atomic)
+            return true
         } catch {
             presentedError = "Viewtiful could not save the document library."
+            return false
+        }
+    }
+
+    private var libraryRecoveryMessage: String {
+        if let libraryRecoveryURL {
+            return "Viewtiful could not read its document library. The damaged metadata was preserved at \(libraryRecoveryURL.path). Choose “Start New Library” only after recovering that file."
+        }
+        return "Viewtiful could not read its document library, and could not preserve a recovery copy. No library changes were made."
+    }
+
+    private func preserveDamagedLibrary(at url: URL?) -> URL? {
+        guard let url, FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let recoveryURL = url.deletingLastPathComponent()
+            .appendingPathComponent("Library.corrupt-\(UUID().uuidString).json")
+        do {
+            try FileManager.default.copyItem(at: url, to: recoveryURL)
+            return recoveryURL
+        } catch {
+            return nil
         }
     }
 
@@ -282,6 +393,10 @@ final class ViewerModel {
     }
 
     private func applicationDirectory() throws -> URL {
+        if let storageDirectory {
+            try FileManager.default.createDirectory(at: storageDirectory, withIntermediateDirectories: true)
+            return storageDirectory
+        }
         let baseURL = try FileManager.default.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
@@ -297,6 +412,7 @@ final class ViewerModel {
         static let lastDocumentID = "lastDocumentID"
         static let startupBehavior = "startupBehavior"
         static let keepScreenAwake = "keepScreenAwake"
+        static let edgeTapNavigationEnabled = "edgeTapNavigationEnabled"
     }
 
     private enum ViewerError: Error {
