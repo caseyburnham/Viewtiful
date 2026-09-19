@@ -281,14 +281,18 @@ private struct GeneralSettingsForm: View {
             }
 
             Section {
-                Toggle("Invert PDF Colors", isOn: $model.invertPDFColors)
+                Picker("PDF Colors", selection: $model.pdfColorAppearance) {
+                    Text("Match System Appearance").tag(PDFColorAppearance.matchSystem)
+                    Text("Normal").tag(PDFColorAppearance.normal)
+                    Text("Inverted").tag(PDFColorAppearance.inverted)
+                }
                 Toggle("Invert Annotations", isOn: $model.invertAnnotations)
                     .disabled(!model.invertPDFColors)
 
             } header: {
                 Text("PDF Appearance")
             } footer: {
-                Text("Preserve annotation colors, or invert them with the page. Marks flattened into the page always invert. The original PDF is unchanged.")
+                Text("Matching the system appearance inverts pages in Dark Mode. Annotation colors are preserved unless you invert them with the page; marks flattened into the page always invert. The original PDF is unchanged.")
             }
 
             Section {

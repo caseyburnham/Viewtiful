@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var colorScheme
     #if os(macOS)
     @Environment(\.openSettings) private var openSettings
     @Environment(\.openWindow) private var openWindow
@@ -12,82 +13,141 @@ struct ContentView: View {
     @Bindable var oscController: OSCController
     @Bindable var midiController: MIDIController
     @State private var screenAwakeController = ScreenAwakeController()
-    @State private var isImporting = false
-    @State private var isShowingLibrary = false
+    @State private var isChoosingDocument = false
     @State private var isShowingSettings = false
     @State private var isShowingMonitor = false
     @State private var isShowingPageEntry = false
-    @State private var controlsVisible = true
-    @State private var zoomLevel: PDFZoomLevel = .fit
-    @State private var pinchStartZoom: Double?
+    @State private var controlsVisible = false
+    @State private var isToolbarHovering = false
+    @State private var controlsAutoHideTask: Task<Void, Never>?
+    @State private var toolbarHeight: CGFloat = 0
     @State private var pageEntry = ""
     @FocusState private var pageEntryFocused: Bool
 
     var body: some View {
-        NavigationStack {
-            viewer
-                .navigationTitle(model.hasDocument ? model.documentName : "Viewtiful")
-                .toolbar { viewerToolbar }
-                #if os(macOS)
-                .toolbarVisibility(controlsVisible ? .visible : .hidden, for: .windowToolbar)
-                #else
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbarVisibility(controlsVisible ? .visible : .hidden, for: .navigationBar)
-                #endif
-        }
-        .sheet(isPresented: $isShowingLibrary) {
-            DocumentLibraryView(model: model)
-                #if os(macOS)
-                .frame(minWidth: 480, idealWidth: 560, minHeight: 360, idealHeight: 480)
-                #endif
-        }
+        navigation
         .sheet(isPresented: $isShowingSettings) {
             GeneralSettingsView(model: model, oscController: oscController, midiController: midiController)
         }
         .sheet(isPresented: $isShowingMonitor) {
             MonitorView(midiController: midiController, oscController: oscController)
         }
-        .fileImporter(isPresented: $isImporting, allowedContentTypes: [.pdf]) { result in
+        .fileImporter(isPresented: $isChoosingDocument, allowedContentTypes: [.pdf]) { result in
             switch result {
-            case .success(let url): model.importDocument(from: url)
-            case .failure(let error): model.reportImportError(error)
+            case .success(let url): model.openDocument(at: url)
+            case .failure(let error): model.reportOpenError(error)
             }
         }
+        // Handed a PDF by Files or the Finder, Viewtiful opens it like any other show.
+        .onOpenURL { model.openDocument(at: $0) }
         .alert("Unable to Complete Action", isPresented: Binding(
-            get: { model.presentedError != nil && !isShowingLibrary },
+            get: { model.presentedError != nil },
             set: { if !$0 { model.clearPresentedError() } }
         )) {
-            if model.libraryNeedsRecovery && model.libraryRecoveryURL != nil {
-                Button("Start New Library", role: .destructive) { model.startNewLibrary() }
-            }
             Button("OK") { model.clearPresentedError() }
         } message: {
             Text(model.presentedError ?? "")
         }
         .focusedSceneValue(\.viewerCommands, ViewerCommandActions(
             hasDocument: model.hasDocument,
-            importDocument: { isImporting = true },
-            showLibrary: { isShowingLibrary = true },
+            openDocument: { isChoosingDocument = true },
+            openLastDocument: model.openLastDocument,
+            canOpenLastDocument: model.canOpenLastDocument,
+            recentDocuments: model.recentDocuments,
+            openRecentDocument: model.openRecentDocument,
+            clearRecentDocuments: model.clearRecentDocuments,
+            showMonitors: showMonitors,
             goToPage: showPageEntry,
             controlsVisible: controlsVisible,
             toggleControls: toggleControls,
-            fitPage: { zoomLevel = .fit },
             perform: model.perform
         ))
+        .onChange(of: colorScheme, initial: true) { model.systemIsDark = colorScheme == .dark }
         .onChange(of: scenePhase, initial: true) { updateLifecycle() }
         .onChange(of: model.keepScreenAwake) { updateLifecycle() }
+        .onChange(of: model.presentationRequest, initial: true) { presentRequestedSheet() }
         .onChange(of: model.hasDocument) {
             if !model.hasDocument { controlsVisible = true }
             updateLifecycle()
         }
-        .onChange(of: model.activeDocumentID) { zoomLevel = .fit }
-        .onDisappear { model.flushPendingPersistence() }
+        .onChange(of: isShowingPageEntry) {
+            if !isShowingPageEntry, controlsVisible {
+                recordControlsInteraction()
+            }
+        }
+        .onDisappear {
+            controlsAutoHideTask?.cancel()
+            model.flushPendingPersistence()
+        }
         .task {
             oscController.onAction = model.perform
             midiController.onAction = model.perform
             updateLifecycle()
         }
     }
+
+    /// Hiding the system bar background lets the document run edge to edge behind the
+    /// toolbar; `toolbarGlass` then supplies the bar itself so page content underneath
+    /// reads through it blurred. On macOS the window toolbar placement only resolves
+    /// against the window's root view, so those modifiers go outside the navigation
+    /// container — nested inside it, `.hidden` only clears the items.
+    @ViewBuilder private var navigation: some View {
+        #if os(macOS)
+        NavigationStack {
+            viewer
+                .navigationTitle(model.hasDocument ? model.documentName : "Viewtiful")
+                .toolbar { viewerToolbar }
+        }
+        .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+        .toolbarVisibility(controlsVisible ? .visible : .hidden, for: .windowToolbar)
+        .background {
+            TitlebarHeightReader { toolbarHeight = $0 }
+            ToolbarHoverMonitor { isHovering in
+                isToolbarHovering = isHovering
+                if isHovering {
+                    showControls()
+                } else if !isShowingPageEntry {
+                    hideControls()
+                }
+            }
+        }
+        #else
+        if model.hasDocument {
+            documentNavigation
+        } else {
+            documentLauncher
+        }
+        #endif
+    }
+
+    #if !os(macOS)
+    private var documentNavigation: some View {
+        NavigationStack {
+            viewer
+                .navigationTitle(model.hasDocument ? model.documentName : "Viewtiful")
+                .toolbar { viewerToolbar }
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbarVisibility(controlsVisible ? .visible : .hidden, for: .navigationBar)
+        }
+    }
+
+    /// The system document launcher: Viewtiful's actions on a card above the same file
+    /// browser Files uses, so shows are opened from where they already live.
+    private var documentLauncher: some View {
+        DocumentLaunchView("Viewtiful", for: [.pdf]) {
+            Button("Open Document") { isChoosingDocument = true }
+            if model.canOpenLastDocument {
+                Button("Open Last") { model.openLastDocument() }
+            }
+        } onDocumentOpen: { url in
+            // The launcher presents this itself once a file is picked from the browser.
+            // Loading it into the model then promotes the viewer to the scene's root.
+            documentNavigation
+                .task(id: url) { model.openDocument(at: url) }
+        }
+        .documentLaunchSubtitle("Turn pages with a keyboard, MIDI, or OSC.")
+    }
+    #endif
 
     private var viewerBackground: Color {
         #if os(macOS)
@@ -104,10 +164,8 @@ struct ContentView: View {
                     viewerBackground
                     PDFPageView(document: document, pageIndex: model.currentPageIndex,
                                 invertColors: model.invertPDFColors, invertAnnotations: model.invertAnnotations,
-                                zoom: zoomLevel,
                                 onPageTurn: turnPage,
-                                onGoToPage: showPageEntry,
-                                onFitPage: { zoomLevel = .fit })
+                                onGoToPage: showPageEntry)
                         .accessibilityLabel("\(model.documentName), page \(model.displayedPageNumber) of \(model.pageCount)")
                         .simultaneousGesture(
                             SpatialTapGesture()
@@ -116,47 +174,56 @@ struct ContentView: View {
                                 }
                         )
                 } else {
+                    // The Mac has no document launcher scene, so this stands in for it with
+                    // the same two choices the iOS launch card offers.
                     ContentUnavailableView {
                         Label("Open a Show Document", systemImage: "doc.richtext")
-                    } description: {
-                        Text("Display a PDF and turn pages with a keyboard, MIDI, or OSC.")
                     } actions: {
-                        Button("Import PDF…", systemImage: "plus") { isImporting = true }
+                        Button("Open Document", systemImage: "folder") { isChoosingDocument = true }
                             .buttonStyle(.borderedProminent)
-                        if !model.documents.isEmpty {
-                            Button("Choose Document…", systemImage: "folder") { isShowingLibrary = true }
+                        if model.canOpenLastDocument {
+                            Button("Open Last", systemImage: "clock.arrow.circlepath") { model.openLastDocument() }
                         }
                     }
                 }
             }
+            // Without a document the stack would otherwise shrink to fit the placeholder,
+            // taking the glass bar overlaid on it in from the window's trailing edge.
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // The bar sits above the document but below the toolbar items, which AppKit
+            // draws into the titlebar on top of the content view.
+            .overlay(alignment: .top) {
+                if controlsVisible {
+                    toolbarGlass(height: toolbarHeight)
+                }
+
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .contentShape(Rectangle())
+        // Fill the titlebar's inset too, so the document scales to the whole window and the
+        // glass bar lands over page content rather than below it.
+        #if os(macOS)
+        .ignoresSafeArea(edges: .top)
+        #else
+        .ignoresSafeArea()
+        #endif
+        // Keep a slim edge free of app gestures so the system resize target remains easy to reach.
+        .contentShape(Rectangle().inset(by: 8))
         .gesture(DragGesture(minimumDistance: 40).onEnded { value in
             guard abs(value.translation.width) > abs(value.translation.height) else { return }
             turnPage(value.translation.width < 0 ? .nextPage : .previousPage)
         })
-        .simultaneousGesture(
-            MagnifyGesture()
-                .onChanged { value in
-                    updateZoom(for: value.magnification)
-                }
-                .onEnded { value in
-                    updateZoom(for: value.magnification)
-                    pinchStartZoom = nil
-                }
-        )
         .focusable()
         .focusEffectDisabled()
         .onKeyPress(phases: .down) { key in
-            guard !isShowingLibrary, !isShowingSettings, !isShowingMonitor, !isImporting, !isShowingPageEntry,
+            guard !isShowingSettings, !isShowingMonitor, !isChoosingDocument, !isShowingPageEntry,
                   key.modifiers.intersection([.command, .control, .option]).isEmpty else { return .ignored }
             switch key.key {
-            case .rightArrow: model.perform(.nextPage)
-            case .leftArrow: model.perform(.previousPage)
-            case .space: model.perform(key.modifiers.contains(.shift) ? .previousPage : .nextPage)
-            case .home: model.perform(.firstPage)
-            case .end: model.perform(.lastPage)
+            case .rightArrow: turnPage(.nextPage)
+            case .leftArrow: turnPage(.previousPage)
+            case .space: turnPage(key.modifiers.contains(.shift) ? .previousPage : .nextPage)
+            case .home: turnPage(.firstPage)
+            case .end: turnPage(.lastPage)
             case .escape: return .ignored
             default: return .ignored
             }
@@ -173,41 +240,59 @@ struct ContentView: View {
         }
     }
 
+    /// A full-width Liquid Glass strip standing in for the system toolbar background,
+    /// which has to be hidden for the document to reach the top of the window.
+    private func toolbarGlass(height: CGFloat) -> some View {
+        Color.clear
+            .frame(height: height)
+            .glassEffect(.regular, in: .rect)
+            .allowsHitTesting(false)
+            .transition(.opacity)
+    }
+
     @ToolbarContentBuilder private var viewerToolbar: some ToolbarContent {
-        ToolbarItemGroup(placement: .navigation) {
-            Button("Documents", systemImage: "folder") { isShowingLibrary = true }
-                .help("Choose a show document")
-            Button("Import PDF", systemImage: "plus") { isImporting = true }
-                .help("Import a PDF")
+        ToolbarItem(placement: .navigation) {
+            Menu {
+                Button("Open Document…", systemImage: "folder") { isChoosingDocument = true }
+                if model.hasDocument {
+                    // The only route back to the launcher once a show is on screen.
+                    Button("Close Document", systemImage: "xmark") { model.closeDocument() }
+                }
+                if !model.recentDocuments.isEmpty {
+                    Section("Recent") {
+                        ForEach(model.recentDocuments) { recent in
+                            Button(recent.displayName) { model.openRecentDocument(recent) }
+                        }
+                    }
+                }
+            } label: {
+                Label("Open", systemImage: "folder")
+            }
+            .help("Open a show document")
         }
         ToolbarSpacer(.fixed)
         ToolbarItem(placement: .primaryAction) {
             Menu {
-                Section("Zoom") {
-                    Button("Zoom In", systemImage: "plus.magnifyingglass") { adjustZoom(by: 1.25) }
-                    Button("Zoom Out", systemImage: "minus.magnifyingglass") { adjustZoom(by: 1 / 1.25) }
-                    Button("Fit Page", systemImage: "arrow.up.left.and.arrow.down.right") { zoomLevel = .fit }
-                }
                 Section("PDF Appearance") {
-                    Toggle("Invert Colors", systemImage: "circle.lefthalf.filled", isOn: $model.invertPDFColors)
+                    Picker("Colors", selection: $model.pdfColorAppearance) {
+                        Label("Match System", systemImage: "circle.lefthalf.filled")
+                            .tag(PDFColorAppearance.matchSystem)
+                        Label("Normal", systemImage: "sun.max").tag(PDFColorAppearance.normal)
+                        Label("Inverted", systemImage: "moon").tag(PDFColorAppearance.inverted)
+                    }
+                    .pickerStyle(.inline)
                 }
                 Button("Hide Controls", systemImage: "eye.slash", action: hideControls)
             } label: {
                 Label("Viewer Options", systemImage: "slider.horizontal.3")
             }
             .disabled(!model.hasDocument)
-            .help("Zoom, PDF appearance, and viewer controls")
+            .help("PDF appearance and viewer controls")
         }
         ToolbarSpacer(.fixed)
         ToolbarItemGroup(placement: .primaryAction) {
-            Button("Monitors", systemImage: "waveform.path.ecg") {
-                #if os(macOS)
-                openWindow(id: "monitors")
-                #else
-                isShowingMonitor = true
-                #endif
-            }
-            .help("Open MIDI and OSC monitors")
+            Button("Monitors", systemImage: "waveform.path.ecg", action: showMonitors)
+                .help("Open MIDI and OSC monitors (Command-Shift-M)")
             Button("Settings", systemImage: "gearshape") {
                 #if os(macOS)
                 openSettings()
@@ -265,8 +350,20 @@ struct ContentView: View {
         }
     }
 
+    private func presentRequestedSheet() {
+        guard let request = model.takePresentationRequest() else { return }
+
+        switch request {
+        case .openDocument:
+            isChoosingDocument = true
+        }
+    }
+
     private func turnPage(_ action: ViewtifulAction) {
         model.perform(action)
+        if controlsVisible {
+            recordControlsInteraction()
+        }
     }
 
     private func handleDocumentTap(at location: CGPoint, in size: CGSize) {
@@ -291,6 +388,8 @@ struct ContentView: View {
 
     private func hideControls() {
         guard controlsVisible else { return }
+        controlsAutoHideTask?.cancel()
+        controlsAutoHideTask = nil
         withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.18)) {
             controlsVisible = false
         }
@@ -299,35 +398,35 @@ struct ContentView: View {
         pageEntry = ""
     }
 
-    private func adjustZoom(by multiplier: Double) {
-        let current: Double
-        switch zoomLevel {
-        case .fit: current = 1
-        case .factor(let factor): current = factor
-        }
-        zoomLevel = .factor(min(max(current * multiplier, 0.25), 4))
-    }
-
     private func toggleControls() {
         guard model.hasDocument else { return }
         if controlsVisible {
             hideControls()
         } else {
-            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.18)) {
-                controlsVisible = true
-            }
+            showControls()
         }
     }
 
-    private func updateZoom(for magnification: CGFloat) {
-        if pinchStartZoom == nil {
-            switch zoomLevel {
-            case .fit: pinchStartZoom = 1
-            case .factor(let factor): pinchStartZoom = factor
-            }
+    private func showControls() {
+        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.18)) {
+            controlsVisible = true
         }
-        if let pinchStartZoom {
-            zoomLevel = .factor(min(max(pinchStartZoom * magnification, 0.25), 4))
+        recordControlsInteraction()
+    }
+
+    private func recordControlsInteraction() {
+        controlsAutoHideTask?.cancel()
+        guard controlsVisible, model.hasDocument, !isShowingPageEntry, !isToolbarHovering else { return }
+
+        controlsAutoHideTask = Task { @MainActor in
+            do {
+                try await Task.sleep(for: .seconds(4))
+            } catch {
+                return
+            }
+
+            guard !Task.isCancelled, controlsVisible, !isShowingPageEntry, !isToolbarHovering else { return }
+            hideControls()
         }
     }
 
@@ -338,9 +437,17 @@ struct ContentView: View {
 
     private func showPageEntry() {
         guard model.hasDocument else { return }
-        controlsVisible = true
+        showControls()
         pageEntry = String(model.displayedPageNumber)
         isShowingPageEntry = true
+    }
+
+    private func showMonitors() {
+        #if os(macOS)
+        openWindow(id: "monitors")
+        #else
+        isShowingMonitor = true
+        #endif
     }
 
     private func jumpToPage() {
@@ -362,14 +469,114 @@ struct ContentView: View {
     }
 }
 
+#if os(macOS)
+/// Observes AppKit mouse events so the hover target includes the actual window titlebar,
+/// where the macOS toolbar is rendered rather than in the SwiftUI content view.
+private struct ToolbarHoverMonitor: NSViewRepresentable {
+    let onChange: (Bool) -> Void
+
+    func makeNSView(context: Context) -> MonitoringView {
+        MonitoringView(onChange: onChange)
+    }
+
+    func updateNSView(_ view: MonitoringView, context: Context) {
+        view.onChange = onChange
+        view.installMonitorIfNeeded()
+    }
+
+    final class MonitoringView: NSView {
+        var onChange: (Bool) -> Void
+        private var eventMonitor: Any?
+
+        init(onChange: @escaping (Bool) -> Void) {
+            self.onChange = onChange
+            super.init(frame: .zero)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { fatalError("ToolbarHoverMonitor is not loaded from a nib") }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            installMonitorIfNeeded()
+        }
+
+        func installMonitorIfNeeded() {
+            guard eventMonitor == nil, window != nil else { return }
+
+            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .mouseMoved) { [weak self] event in
+                guard let self, let window = event.window ?? self.window else { return event }
+                let isInToolbar = event.locationInWindow.y >= window.contentLayoutRect.maxY
+                self.onChange(isInToolbar)
+                return event
+            }
+        }
+
+        deinit {
+            if let eventMonitor {
+                NSEvent.removeMonitor(eventMonitor)
+            }
+        }
+    }
+}
+
+/// Reports the height the window reserves for its titlebar and toolbar. The viewer's
+/// content view already spans the full window, so there is no safe area inset to read.
+private struct TitlebarHeightReader: NSViewRepresentable {
+    let onChange: (CGFloat) -> Void
+
+    func makeNSView(context: Context) -> ReportingView { ReportingView(onChange: onChange) }
+
+    func updateNSView(_ view: ReportingView, context: Context) {
+        view.onChange = onChange
+        view.report()
+    }
+
+    final class ReportingView: NSView {
+        var onChange: (CGFloat) -> Void
+        private var reported: CGFloat?
+
+        init(onChange: @escaping (CGFloat) -> Void) {
+            self.onChange = onChange
+            super.init(frame: .zero)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { fatalError("TitlebarHeightReader is not loaded from a nib") }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            report()
+        }
+
+        override func layout() {
+            super.layout()
+            report()
+        }
+
+        func report() {
+            guard let window else { return }
+            let height = max(0, window.frame.height - window.contentLayoutRect.height)
+            guard height != reported else { return }
+            reported = height
+            onChange(height)
+        }
+    }
+}
+#endif
+
 struct ViewerCommandActions {
     let hasDocument: Bool
-    let importDocument: () -> Void
-    let showLibrary: () -> Void
+    let openDocument: () -> Void
+    let openLastDocument: () -> Void
+    let canOpenLastDocument: Bool
+    let recentDocuments: [RecentDocument]
+    let openRecentDocument: (RecentDocument) -> Void
+    let clearRecentDocuments: () -> Void
+    let showMonitors: () -> Void
     let goToPage: () -> Void
     let controlsVisible: Bool
     let toggleControls: () -> Void
-    let fitPage: () -> Void
     let perform: (ViewtifulAction) -> Void
 }
 
@@ -386,13 +593,35 @@ extension FocusedValues {
 
 struct ViewerCommands: Commands {
     @FocusedValue(\.viewerCommands) private var viewer
+    let requestPresentation: (ViewerPresentationRequest) -> Void
+    let openViewer: () -> Void
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
-            Button("Import PDF…") { viewer?.importDocument() }
-                .keyboardShortcut("o")
-            Button("Documents…") { viewer?.showLibrary() }
-                .keyboardShortcut("o", modifiers: [.command, .shift])
+            Button("Open Document…") {
+                requestPresentation(.openDocument)
+                openViewer()
+            }
+            .keyboardShortcut("o")
+
+            Button("Open Last") {
+                openViewer()
+                viewer?.openLastDocument()
+            }
+            .keyboardShortcut("o", modifiers: [.command, .shift])
+            .disabled(viewer?.canOpenLastDocument != true)
+
+            Menu("Open Recent") {
+                ForEach(viewer?.recentDocuments ?? []) { recent in
+                    Button(recent.displayName) {
+                        openViewer()
+                        viewer?.openRecentDocument(recent)
+                    }
+                }
+                Divider()
+                Button("Clear Menu") { viewer?.clearRecentDocuments() }
+            }
+            .disabled(viewer?.recentDocuments.isEmpty != false)
         }
         CommandMenu("Page") {
             Group {
@@ -403,7 +632,6 @@ struct ViewerCommands: Commands {
             Button("Last Page") { viewer?.perform(.lastPage) }
             Button("Go to Page…") { viewer?.goToPage() }
                 .keyboardShortcut("l")
-            Button("Fit Page") { viewer?.fitPage() }.keyboardShortcut("0")
             }
             .disabled(viewer?.hasDocument != true)
         }
@@ -411,6 +639,8 @@ struct ViewerCommands: Commands {
             Button(viewer?.controlsVisible == false ? "Show Controls" : "Hide Controls") { viewer?.toggleControls() }
                 .keyboardShortcut("t", modifiers: [.command, .option])
                 .disabled(viewer?.hasDocument != true)
+            Button("Show Monitors") { viewer?.showMonitors() }
+                .keyboardShortcut("m", modifiers: [.command, .shift])
         }
     }
 }

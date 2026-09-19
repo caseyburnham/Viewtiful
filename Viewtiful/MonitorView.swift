@@ -52,12 +52,15 @@ private struct MIDIMonitorView: View {
                 if let error = controller.setupError {
                     Label(error, systemImage: "exclamationmark.triangle")
                 }
-                LabeledContent("Connected Sources", value: controller.sources.count.formatted())
+                LabeledContent(
+                    "Connected Sources",
+                    value: controller.sources.isEmpty ? "No Connected Sources" : controller.sources.map(\.name).formatted()
+                )
             }
 
             Section("Recent Messages") {
                 if controller.activityHistory.isEmpty {
-                    Text(controller.enabled ? "Play a connected MIDI control to see its messages." : "Enable MIDI in Settings to receive messages.")
+                    Text("No Commands Received")
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(controller.activityHistory) { activity in
@@ -112,7 +115,17 @@ private struct OSCMonitorView: View {
         List {
             Section("Listener") {
                 LabeledContent("Status", value: controller.status.label)
-                LabeledContent("UDP Port", value: controller.port.formatted())
+                LabeledContent("UDP Port", value: String(controller.port))
+                if controller.localAddresses.isEmpty {
+                    LabeledContent("IP Address", value: "Unavailable")
+                } else {
+                    ForEach(controller.localAddresses) { localAddress in
+                        LabeledContent(
+                            "IP Address (\(localAddress.interfaceName))",
+                            value: localAddress.address
+                        )
+                    }
+                }
                 if controller.rejectedPacketCount > 0 {
                     LabeledContent("Rejected Packets", value: controller.rejectedPacketCount.formatted())
                     LabeledContent("Malformed Packets", value: controller.malformedPacketCount.formatted())
@@ -122,7 +135,7 @@ private struct OSCMonitorView: View {
 
             Section("Recent Messages") {
                 if controller.messageHistory.isEmpty {
-                    Text(controller.status.isRunning ? "Send an OSC command to see it here." : "The OSC listener is not running. Check OSC in Settings.")
+                    Text("No Commands Received")
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(controller.messageHistory) { activity in
