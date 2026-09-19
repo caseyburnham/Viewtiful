@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct Viewtiful: App {
+struct ViewtifulApp: App {
     @Environment(\.openWindow) private var openWindow
     @State private var model = ViewerModel()
     @State private var oscController = OSCController()
