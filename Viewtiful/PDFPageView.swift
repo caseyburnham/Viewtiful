@@ -23,20 +23,35 @@ struct PDFPageView: NSViewRepresentable {
         view.onPageTurn = onPageTurn
         view.onGoToPage = onGoToPage
         if context.coordinator.source !== document { view.needsWindowFit = true }
+        let previousPage = view.currentPage
         update(view, cache: context.coordinator)
         view.fitWindowIfNeeded()
-        // PDFKit rebuilds its annotation layers for each page it lays out.
-        view.scheduleAnnotationLayerScaleFix()
+        // PDFKit rebuilds its annotation layers for each page it lays out, so only a
+        // page that actually changed needs the sweep. Updates that leave the page
+        // alone — a toolbar fading in, say — would otherwise redraw it for nothing.
+        if view.currentPage !== previousPage {
+            view.scheduleAnnotationLayerScaleFix()
+        }
     }
 }
 
 /// PDFKit owns rendering and accessibility. The show viewer owns page navigation.
-final class ShowPDFView: PDFView {
+final class ShowPDFView: PDFView, PDFViewDelegate {
     var onPageTurn: ((ViewtifulAction) -> Void)?
     var onGoToPage: (() -> Void)?
     var needsWindowFit = true
     private var scrollNavigation = ScrollPageNavigation()
     private var pendingAnnotationScalePasses = 0
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        delegate = self
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        delegate = self
+    }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         // Keep PDFKit's internal scroll view from independently changing the page.
@@ -84,18 +99,52 @@ final class ShowPDFView: PDFView {
         if let action { onPageTurn?(action) }
     }
 
+    // MARK: - Zoom
+
+    /// Zooming is off: the page is always drawn at the largest scale that fits the
+    /// view. Every scale change — pinch, smart magnify, the zoom actions, and
+    /// PDFKit's own autoscaling — passes through here, so answering with the
+    /// size-to-fit scale keeps the page fitted and refuses everything else.
+    func pdfViewWillChangeScaleFactor(_ sender: PDFView, toScale scale: CGFloat) -> CGFloat {
+        let fit = sender.scaleFactorForSizeToFit
+        return fit > 0 && fit.isFinite ? fit : scale
+    }
+
+    override func magnify(with event: NSEvent) {}
+
+    override func smartMagnify(with event: NSEvent) {}
+
+    override var canZoomIn: Bool { false }
+
+    override var canZoomOut: Bool { false }
+
+    override func zoomIn(_ sender: Any?) {}
+
+    override func zoomOut(_ sender: Any?) {}
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         // Wait for SwiftUI to lay out the document viewport before sizing its window.
         DispatchQueue.main.async { [weak self] in self?.fitWindowIfNeeded() }
     }
 
-    /// PDFKit otherwise insets its content below the titlebar. Clearing that lets the page
-    /// scale to the whole window and slide under the toolbar's glass.
-    private func disableContentInsets() {
-        guard let scrollView = firstScrollView(in: self), scrollView.automaticallyAdjustsContentInsets else { return }
-        scrollView.automaticallyAdjustsContentInsets = false
-        scrollView.contentInsets = .init()
+    /// AppKit hands every view under the window's full-size titlebar a top safe area
+    /// inset, and PDFKit lays its page out inside it. The toolbar floats over the page
+    /// here rather than reserving space, so the whole view is fair game.
+    override var safeAreaInsets: NSEdgeInsets { NSEdgeInsets() }
+
+    /// PDFKit also insets its own scroll view below the titlebar, and re-applies that
+    /// while laying out, so the insets are cleared on every pass rather than once.
+    private func clearContentInsets() {
+        guard let scrollView = firstScrollView(in: self) else { return }
+        if scrollView.automaticallyAdjustsContentInsets {
+            scrollView.automaticallyAdjustsContentInsets = false
+        }
+        // Reassigning unconditionally would invalidate layout on every pass.
+        let insets = scrollView.contentInsets
+        if insets.top != 0 || insets.bottom != 0 || insets.left != 0 || insets.right != 0 {
+            scrollView.contentInsets = NSEdgeInsets()
+        }
     }
 
     private func firstScrollView(in view: NSView) -> NSScrollView? {
@@ -107,8 +156,10 @@ final class ShowPDFView: PDFView {
     }
 
     override func layout() {
-        disableContentInsets()
+        clearContentInsets()
         super.layout()
+        // PDFKit reserves the titlebar's space again as it lays the page out.
+        clearContentInsets()
         if needsWindowFit {
             DispatchQueue.main.async { [weak self] in self?.fitWindowIfNeeded() }
         }
@@ -198,15 +249,91 @@ struct PDFPageView: UIViewRepresentable {
     let onPageTurn: (ViewtifulAction) -> Void
     let onGoToPage: () -> Void
 
-    func makeUIView(context: Context) -> PDFView {
-        let view = PDFView()
+    func makeUIView(context: Context) -> FitPDFView {
+        let view = FitPDFView()
         configure(view)
         update(view, cache: context.coordinator)
         return view
     }
 
-    func updateUIView(_ view: PDFView, context: Context) {
+    func updateUIView(_ view: FitPDFView, context: Context) {
         update(view, cache: context.coordinator)
+    }
+}
+
+/// Zooming is off: the page is always drawn at the largest scale that fits the view.
+final class FitPDFView: PDFView, PDFViewDelegate {
+    /// Walk from PDFKit's public document view to its containing scroll view.
+    var contentScrollView: UIScrollView? {
+        var ancestor = documentView?.superview
+        while let view = ancestor, view !== self {
+            if let scrollView = view as? UIScrollView { return scrollView }
+            ancestor = view.superview
+        }
+        return nil
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        delegate = self
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        delegate = self
+    }
+
+    /// UIKit hands the view the status and navigation bars' inset, and PDFKit fits the
+    /// page inside whatever is left. The bar floats over the page rather than reserving
+    /// space, so the whole view is fair game and the page fills it.
+    override var safeAreaInsets: UIEdgeInsets { .zero }
+
+    override func layoutSubviews() {
+        // The native toolbar overlays the page; its safe area must never alter fit.
+        preventToolbarInsets()
+        super.layoutSubviews()
+        preventToolbarInsets()
+        // PDFKit rebuilds its scrolling machinery as pages lay out, so sweep each pass.
+        disableZoomGestures(in: self)
+    }
+
+    private func preventToolbarInsets() {
+        guard let scrollView = contentScrollView else { return }
+        if scrollView.contentInsetAdjustmentBehavior != .never {
+            scrollView.contentInsetAdjustmentBehavior = .never
+        }
+        // Reassigning unconditionally would invalidate layout on every pass.
+        if scrollView.contentInset != .zero {
+            scrollView.contentInset = .zero
+        }
+    }
+
+    /// Every scale change — pinch, double tap, and PDFKit's own autoscaling — passes
+    /// through here, so answering with the size-to-fit scale keeps the page fitted
+    /// and refuses everything else.
+    func pdfViewWillChangeScaleFactor(_ sender: PDFView, toScale scale: CGFloat) -> CGFloat {
+        let fit = sender.scaleFactorForSizeToFit
+        return fit > 0 && fit.isFinite ? fit : scale
+    }
+
+    /// The scroll view zooms itself for a pinch or a double tap and only tells PDFKit
+    /// afterwards, so it never asks for a scale factor and the delegate above never
+    /// gets the chance to refuse. The gestures have to be taken away instead.
+    private func disableZoomGestures(in view: UIView) {
+        if let scrollView = view as? UIScrollView, scrollView.bouncesZoom {
+            scrollView.bouncesZoom = false
+        }
+        for recognizer in view.gestureRecognizers ?? [] {
+            switch recognizer {
+            case is UIPinchGestureRecognizer:
+                recognizer.isEnabled = false
+            case let tap as UITapGestureRecognizer where tap.numberOfTapsRequired > 1:
+                tap.isEnabled = false
+            default:
+                break
+            }
+        }
+        for subview in view.subviews { disableZoomGestures(in: subview) }
     }
 }
 #endif
@@ -221,13 +348,18 @@ extension PDFPageView {
         view.autoScales = true
     }
 
+    /// SwiftUI reruns this for any state the viewer touches, most of which has nothing
+    /// to do with the page — a toolbar fading in, the pointer moving. Every assignment
+    /// here is therefore guarded: PDFKit relays out the document and redraws the page
+    /// when these are set, even when set to the value they already hold.
     func update(_ view: PDFView, cache: PDFDisplayCache) {
-        view.pageShadowsEnabled = false
+        if view.pageShadowsEnabled { view.pageShadowsEnabled = false }
         #if os(macOS)
-        view.backgroundColor = invertColors ? .black : .windowBackgroundColor
+        let background: NSColor = invertColors ? .black : .windowBackgroundColor
         #else
-        view.backgroundColor = invertColors ? .black : .systemBackground
+        let background: UIColor = invertColors ? .black : .systemBackground
         #endif
+        if view.backgroundColor != background { view.backgroundColor = background }
         let displayed = cache.document(source: document, pageIndex: pageIndex,
                                        inverted: invertColors, invertAnnotations: invertAnnotations)
         if view.document !== displayed { view.document = displayed }
@@ -236,6 +368,8 @@ extension PDFPageView {
             view.go(to: page)
         }
         // The page always scales to the window; there is no manual zoom to preserve.
-        view.autoScales = true
+        // Assigning this rescales the page, so it is only restored if something
+        // actually turned it off.
+        if !view.autoScales { view.autoScales = true }
     }
 }

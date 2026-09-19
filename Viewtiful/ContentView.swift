@@ -20,7 +20,6 @@ struct ContentView: View {
     @State private var controlsVisible = false
     @State private var isToolbarHovering = false
     @State private var controlsAutoHideTask: Task<Void, Never>?
-    @State private var toolbarHeight: CGFloat = 0
     @State private var pageEntry = ""
     @FocusState private var pageEntryFocused: Bool
 
@@ -67,7 +66,8 @@ struct ContentView: View {
         .onChange(of: model.keepScreenAwake) { updateLifecycle() }
         .onChange(of: model.presentationRequest, initial: true) { presentRequestedSheet() }
         .onChange(of: model.hasDocument) {
-            if !model.hasDocument { controlsVisible = true }
+            controlsAutoHideTask?.cancel()
+            controlsVisible = !model.hasDocument
             updateLifecycle()
         }
         .onChange(of: isShowingPageEntry) {
@@ -86,22 +86,22 @@ struct ContentView: View {
         }
     }
 
-    /// Hiding the system bar background lets the document run edge to edge behind the
-    /// toolbar; `toolbarGlass` then supplies the bar itself so page content underneath
-    /// reads through it blurred. On macOS the window toolbar placement only resolves
-    /// against the window's root view, so those modifiers go outside the navigation
-    /// container — nested inside it, `.hidden` only clears the items.
     @ViewBuilder private var navigation: some View {
         #if os(macOS)
         NavigationStack {
             viewer
                 .navigationTitle(model.hasDocument ? model.documentName : "Viewtiful")
                 .toolbar { viewerToolbar }
+                .scrollEdgeEffectStyle(.soft, for: .top)
         }
-        .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+        // The stack defines its own safe area region, so the document ignoring the
+        // titlebar inset inside it only reaches the top of the window if the stack
+        // gives up that inset too.
+        .ignoresSafeArea(edges: .top)
         .toolbarVisibility(controlsVisible ? .visible : .hidden, for: .windowToolbar)
+        .toolbarBackgroundVisibility(controlsVisible ? .automatic : .hidden, for: .windowToolbar)
         .background {
-            TitlebarHeightReader { toolbarHeight = $0 }
+            TitlebarConfigurator()
             ToolbarHoverMonitor { isHovering in
                 isToolbarHovering = isHovering
                 if isHovering {
@@ -122,13 +122,13 @@ struct ContentView: View {
 
     #if !os(macOS)
     private var documentNavigation: some View {
-        NavigationStack {
+        DocumentNavigation(controlsVisible: controlsVisible, reduceMotion: reduceMotion) {
             viewer
                 .navigationTitle(model.hasDocument ? model.documentName : "Viewtiful")
                 .toolbar { viewerToolbar }
                 .navigationBarTitleDisplayMode(.inline)
-                .toolbarVisibility(controlsVisible ? .visible : .hidden, for: .navigationBar)
         }
+        .ignoresSafeArea()
     }
 
     /// The system document launcher: Viewtiful's actions on a card above the same file
@@ -187,21 +187,10 @@ struct ContentView: View {
                     }
                 }
             }
-            // Without a document the stack would otherwise shrink to fit the placeholder,
-            // taking the glass bar overlaid on it in from the window's trailing edge.
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            // The bar sits above the document but below the toolbar items, which AppKit
-            // draws into the titlebar on top of the content view.
-            .overlay(alignment: .top) {
-                if controlsVisible {
-                    toolbarGlass(height: toolbarHeight)
-                }
-
-            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        // Fill the titlebar's inset too, so the document scales to the whole window and the
-        // glass bar lands over page content rather than below it.
+        // Fit the document to the whole viewport, including the area beneath controls.
         #if os(macOS)
         .ignoresSafeArea(edges: .top)
         #else
@@ -240,14 +229,8 @@ struct ContentView: View {
         }
     }
 
-    /// A full-width Liquid Glass strip standing in for the system toolbar background,
-    /// which has to be hidden for the document to reach the top of the window.
-    private func toolbarGlass(height: CGFloat) -> some View {
-        Color.clear
-            .frame(height: height)
-            .glassEffect(.regular, in: .rect)
-            .allowsHitTesting(false)
-            .transition(.opacity)
+    private var controlsAnimation: Animation? {
+        reduceMotion ? nil : .easeInOut(duration: 0.18)
     }
 
     @ToolbarContentBuilder private var viewerToolbar: some ToolbarContent {
@@ -269,7 +252,9 @@ struct ContentView: View {
                 Label("Open", systemImage: "folder")
             }
             .help("Open a show document")
+            .fadesWithControls(controlsVisible, animation: controlsAnimation)
         }
+        .sharedBackgroundVisibility(.hidden)
         ToolbarSpacer(.fixed)
         ToolbarItem(placement: .primaryAction) {
             Menu {
@@ -288,11 +273,14 @@ struct ContentView: View {
             }
             .disabled(!model.hasDocument)
             .help("PDF appearance and viewer controls")
+            .fadesWithControls(controlsVisible, animation: controlsAnimation)
         }
+        .sharedBackgroundVisibility(.hidden)
         ToolbarSpacer(.fixed)
         ToolbarItemGroup(placement: .primaryAction) {
             Button("Monitors", systemImage: "waveform.path.ecg", action: showMonitors)
                 .help("Open MIDI and OSC monitors (Command-Shift-M)")
+                .fadesWithControls(controlsVisible, animation: controlsAnimation)
             Button("Settings", systemImage: "gearshape") {
                 #if os(macOS)
                 openSettings()
@@ -301,7 +289,9 @@ struct ContentView: View {
                 #endif
             }
             .help("Open Settings")
+            .fadesWithControls(controlsVisible, animation: controlsAnimation)
         }
+        .sharedBackgroundVisibility(.hidden)
     }
 
     private var pageNavigationControls: some View {
@@ -390,7 +380,7 @@ struct ContentView: View {
         guard controlsVisible else { return }
         controlsAutoHideTask?.cancel()
         controlsAutoHideTask = nil
-        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.18)) {
+        withAnimation(controlsAnimation) {
             controlsVisible = false
         }
         isShowingPageEntry = false
@@ -408,8 +398,10 @@ struct ContentView: View {
     }
 
     private func showControls() {
-        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.18)) {
-            controlsVisible = true
+        if !controlsVisible {
+            withAnimation(controlsAnimation) {
+                controlsVisible = true
+            }
         }
         recordControlsInteraction()
     }
@@ -487,6 +479,7 @@ private struct ToolbarHoverMonitor: NSViewRepresentable {
     final class MonitoringView: NSView {
         var onChange: (Bool) -> Void
         private var eventMonitor: Any?
+        private var reported: Bool?
 
         init(onChange: @escaping (Bool) -> Void) {
             self.onChange = onChange
@@ -505,9 +498,14 @@ private struct ToolbarHoverMonitor: NSViewRepresentable {
             guard eventMonitor == nil, window != nil else { return }
 
             eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .mouseMoved) { [weak self] event in
-                guard let self, let window = event.window ?? self.window else { return event }
+                guard let self, let window = self.window, event.window === window else { return event }
                 let isInToolbar = event.locationInWindow.y >= window.contentLayoutRect.maxY
-                self.onChange(isInToolbar)
+                // This runs for every mouse move. Reporting each one would churn the
+                // viewer's state, and with it the whole view body, as the pointer travels.
+                if isInToolbar != self.reported {
+                    self.reported = isInToolbar
+                    self.onChange(isInToolbar)
+                }
                 return event
             }
         }
@@ -520,50 +518,114 @@ private struct ToolbarHoverMonitor: NSViewRepresentable {
     }
 }
 
-/// Reports the height the window reserves for its titlebar and toolbar. The viewer's
-/// content view already spans the full window, so there is no safe area inset to read.
-private struct TitlebarHeightReader: NSViewRepresentable {
-    let onChange: (CGFloat) -> Void
-
-    func makeNSView(context: Context) -> ReportingView { ReportingView(onChange: onChange) }
+/// Keeps the document beneath the native window toolbar.
+private struct TitlebarConfigurator: NSViewRepresentable {
+    func makeNSView(context: Context) -> ReportingView { ReportingView() }
 
     func updateNSView(_ view: ReportingView, context: Context) {
-        view.onChange = onChange
-        view.report()
+        view.configureWindow()
     }
 
     final class ReportingView: NSView {
-        var onChange: (CGFloat) -> Void
-        private var reported: CGFloat?
-
-        init(onChange: @escaping (CGFloat) -> Void) {
-            self.onChange = onChange
-            super.init(frame: .zero)
-        }
-
-        @available(*, unavailable)
-        required init?(coder: NSCoder) { fatalError("TitlebarHeightReader is not loaded from a nib") }
-
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            report()
+            configureWindow()
         }
 
-        override func layout() {
-            super.layout()
-            report()
-        }
-
-        func report() {
+        /// Without a full-size content view AppKit lays the content out below the
+        /// titlebar, so every toolbar toggle resizes it — and the document with it.
+        func configureWindow() {
             guard let window else { return }
-            let height = max(0, window.frame.height - window.contentLayoutRect.height)
-            guard height != reported else { return }
-            reported = height
-            onChange(height)
+            if !window.styleMask.contains(.fullSizeContentView) {
+                window.styleMask.insert(.fullSizeContentView)
+            }
         }
+
     }
 }
 #endif
+
+#if !os(macOS)
+/// A permanent system navigation bar above the full-size document. Changing alpha
+/// fades its buttons and glass together without changing the PDF's layout guides.
+private struct DocumentNavigation<Content: View>: UIViewControllerRepresentable {
+    let controlsVisible: Bool
+    let reduceMotion: Bool
+    @ViewBuilder let content: () -> Content
+
+    func makeUIViewController(context: Context) -> UINavigationController {
+        let host = DocumentHostingController(rootView: content())
+        let navigation = UINavigationController(rootViewController: host)
+        navigation.loadViewIfNeeded()
+        host.setControlsVisible(controlsVisible, animated: false)
+        return navigation
+    }
+
+    func updateUIViewController(_ navigation: UINavigationController, context: Context) {
+        guard let host = navigation.viewControllers.first as? DocumentHostingController<Content> else { return }
+        host.rootView = content()
+        host.setControlsVisible(controlsVisible, animated: !reduceMotion && !context.transaction.disablesAnimations)
+    }
+}
+
+private final class DocumentHostingController<Content: View>: UIHostingController<Content> {
+    private var controlsVisible: Bool?
+    private weak var pdfScrollView: UIScrollView?
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        // PDFKit owns (and can replace) its scroll view. Register it with UIKit's
+        // native bar machinery instead of drawing a blur over the document ourselves.
+        guard let scrollView = findPDFView(in: view)?.contentScrollView,
+              scrollView !== pdfScrollView else { return }
+        pdfScrollView = scrollView
+        scrollView.topEdgeEffect.style = .soft
+        scrollView.topEdgeEffect.isHidden = controlsVisible != true
+        setContentScrollView(scrollView, for: .top)
+    }
+
+    func setControlsVisible(_ visible: Bool, animated: Bool) {
+        guard let bar = navigationController?.navigationBar,
+              controlsVisible != visible else { return }
+        let hasPresentedControls = controlsVisible != nil
+        controlsVisible = visible
+        bar.isUserInteractionEnabled = visible
+        bar.accessibilityElementsHidden = !visible
+        let changes = {
+            bar.alpha = visible ? 1 : 0
+            self.pdfScrollView?.topEdgeEffect.isHidden = !visible
+        }
+        if animated && hasPresentedControls {
+            UIView.animate(withDuration: 0.18, delay: 0,
+                           options: [.beginFromCurrentState, .curveEaseInOut, .allowUserInteraction],
+                           animations: changes)
+        } else {
+            changes()
+        }
+    }
+
+    private func findPDFView(in view: UIView) -> FitPDFView? {
+        if let pdf = view as? FitPDFView { return pdf }
+        for child in view.subviews {
+            if let pdf = findPDFView(in: child) { return pdf }
+        }
+        return nil
+    }
+}
+#endif
+
+private extension View {
+    /// The bar's own alpha only reaches what the system draws inside it — its
+    /// background and title. Toolbar items are rendered separately and outlive that
+    /// fade, so their content is faded here. The animation is attached rather than
+    /// inherited because the transaction driving `controlsVisible` does not reach
+    /// content the system hosts outside the view tree.
+    func fadesWithControls(_ visible: Bool, animation: Animation?) -> some View {
+        opacity(visible ? 1 : 0)
+            .allowsHitTesting(visible)
+            .animation(animation, value: visible)
+    }
+}
 
 struct ViewerCommandActions {
     let hasDocument: Bool
