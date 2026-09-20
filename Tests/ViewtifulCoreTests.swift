@@ -72,7 +72,7 @@ struct ViewtifulCoreTests {
         let suite = "ViewtifulTests.\(UUID())"
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
-        #expect(OSCController(defaults: defaults).port == 53_001)
+        #expect(OSCClient(defaults: defaults).port == 53_001)
         #expect(OSCListenerStatus.failed("Address already in use").label == "Unavailable: Address already in use")
     }
 
@@ -241,7 +241,7 @@ struct ViewtifulCoreTests {
         let suite = "ViewtifulTests.\(UUID())"
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
-        let controller = OSCController(defaults: defaults)
+        let controller = OSCClient(defaults: defaults)
         // Private loopback test port; no application preferences are touched.
         controller.port = Int.random(in: 55000...64000)
         controller.setAvailable(true)
@@ -318,9 +318,8 @@ struct ViewtifulCoreTests {
         }
         let source = root.appendingPathComponent("Test.pdf")
         #expect(pdf.write(to: source))
-        let storage = root.appendingPathComponent("Library")
-        let model = ViewerModel(defaults: defaults, storageDirectory: storage)
-        model.importDocument(from: source)
+        let model = ViewerModel(defaults: defaults)
+        model.openDocument(at: source)
         #expect(model.pageCount == 3)
         model.perform(.previousPage)
         #expect(model.displayedPageNumber == 3)
@@ -331,9 +330,10 @@ struct ViewtifulCoreTests {
         #expect(model.displayedPageNumber == 1)
         model.perform(.goToPage(2))
         model.flushPendingPersistence()
-        let restored = ViewerModel(defaults: defaults, storageDirectory: storage)
+        let restored = ViewerModel(defaults: defaults)
+        restored.openLastDocument()
         #expect(restored.displayedPageNumber == 2)
-        restored.removeDocument(try #require(restored.activeDocument))
+        restored.closeDocument()
         #expect(!restored.hasDocument)
         #expect(FileManager.default.fileExists(atPath: source.path))
     }
@@ -351,36 +351,4 @@ struct ViewtifulCoreTests {
         #expect(!restored.edgeTapNavigationEnabled)
     }
 
-    @Test @MainActor func damagedLibraryIsPreservedUntilExplicitRecovery() throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let suite = "ViewtifulTests.\(UUID())"
-        let defaults = try #require(UserDefaults(suiteName: suite))
-        defer {
-            try? FileManager.default.removeItem(at: root)
-            defaults.removePersistentDomain(forName: suite)
-        }
-
-        let storage = root.appendingPathComponent("Library")
-        try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
-        let libraryURL = storage.appendingPathComponent("Library.json")
-        let damagedData = Data("not valid library metadata".utf8)
-        try damagedData.write(to: libraryURL)
-
-        let model = ViewerModel(defaults: defaults, storageDirectory: storage)
-        #expect(model.documents.isEmpty)
-        #expect(model.libraryNeedsRecovery)
-        let recoveryURL = try #require(model.libraryRecoveryURL)
-        #expect(FileManager.default.fileExists(atPath: recoveryURL.path))
-        #expect(try Data(contentsOf: recoveryURL) == damagedData)
-
-        model.importDocument(from: root.appendingPathComponent("not-a-pdf.pdf"))
-        #expect(model.libraryNeedsRecovery)
-        #expect(try Data(contentsOf: libraryURL) == damagedData)
-
-        model.startNewLibrary()
-        #expect(!model.libraryNeedsRecovery)
-        let recovered = try JSONDecoder().decode([ShowDocument].self, from: Data(contentsOf: libraryURL))
-        #expect(recovered.isEmpty)
-        #expect(FileManager.default.fileExists(atPath: recoveryURL.path))
-    }
 }

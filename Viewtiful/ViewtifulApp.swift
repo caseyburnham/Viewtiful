@@ -1,10 +1,11 @@
 import SwiftUI
 
 @main
+@MainActor
 struct ViewtifulApp: App {
     @Environment(\.openWindow) private var openWindow
     @State private var model = ViewerModel()
-    @State private var oscController = OSCController()
+    @State private var oscController = OSCClient()
     @State private var midiController = MIDIController()
 
     var body: some Scene {

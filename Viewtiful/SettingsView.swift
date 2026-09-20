@@ -205,7 +205,7 @@ private struct MIDISettingsSection: View {
 
 struct GeneralSettingsView: View {
     @Bindable var model: ViewerModel
-    @Bindable var oscController: OSCController
+    @Bindable var oscController: OSCClient
     @Bindable var midiController: MIDIController
     @Environment(\.dismiss) private var dismiss
 
@@ -315,7 +315,7 @@ private struct GeneralSettingsForm: View {
 }
 
 private struct OSCSettingsForm: View {
-    @Bindable var controller: OSCController
+    @Bindable var controller: OSCClient
 
     var body: some View {
         Form {

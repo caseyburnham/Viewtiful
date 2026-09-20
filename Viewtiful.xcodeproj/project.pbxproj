@@ -6,6 +6,10 @@
 	objectVersion = 90;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		E5A002000000000000000001 /* ShowControlCore in Frameworks */ = {isa = PBXBuildFile; productRef = E5A001000000000000000001 /* ShowControlCore */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		000000000000000000000120 /* Viewtiful.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Viewtiful.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -35,6 +39,7 @@
 		000000000000000130000000 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
+				E5A002000000000000000001 /* ShowControlCore in Frameworks */,
 			);
 		};
 /* End PBXFrameworksBuildPhase section */
@@ -73,6 +78,9 @@
 				000000000000000000000010 /* Viewtiful */,
 			);
 			name = Viewtiful;
+			packageProductDependencies = (
+				E5A001000000000000000001 /* ShowControlCore */,
+			);
 			productName = MyApp;
 			productReference = 000000000000000000000120 /* Viewtiful.app */;
 			productType = "com.apple.product-type.application";
@@ -101,6 +109,9 @@
 			);
 			mainGroup = 000000000000000000000001;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				E5A000000000000000000001 /* XCLocalSwiftPackageReference "../ShowControlCore" */,
+			);
 			preferredProjectObjectVersion = 90;
 			productRefGroup = 000000000000000000000020 /* Products */;
 			projectDirPath = "";
@@ -388,6 +399,21 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		E5A000000000000000000001 /* XCLocalSwiftPackageReference "../ShowControlCore" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../ShowControlCore;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		E5A001000000000000000001 /* ShowControlCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = E5A000000000000000000001 /* XCLocalSwiftPackageReference "../ShowControlCore" */;
+			productName = ShowControlCore;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 000000000000000000000000 /* Project object */;
 }

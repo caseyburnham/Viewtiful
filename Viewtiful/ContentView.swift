@@ -1,5 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import ShowControlCore
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
@@ -10,7 +11,7 @@ struct ContentView: View {
     @Environment(\.openWindow) private var openWindow
     #endif
     @Bindable var model: ViewerModel
-    @Bindable var oscController: OSCController
+    @Bindable var oscController: OSCClient
     @Bindable var midiController: MIDIController
     @State private var screenAwakeController = ScreenAwakeController()
     @State private var isChoosingDocument = false
@@ -25,6 +26,12 @@ struct ContentView: View {
 
     var body: some View {
         navigation
+        .transaction { transaction in
+            if reduceMotion {
+                transaction.animation = nil
+                transaction.disablesAnimations = true
+            }
+        }
         .sheet(isPresented: $isShowingSettings) {
             GeneralSettingsView(model: model, oscController: oscController, midiController: midiController)
         }
@@ -224,13 +231,13 @@ struct ContentView: View {
             if model.hasDocument, controlsVisible {
                 pageNavigationControls
                     .padding()
-                    .transition(.opacity)
+                    .transition(reduceMotion ? .identity : .opacity)
             }
         }
     }
 
     private var controlsAnimation: Animation? {
-        reduceMotion ? nil : .easeInOut(duration: 0.18)
+        reduceMotion ? nil : .easeInOut(duration: ShowControlMotion.controlsFadeDuration)
     }
 
     @ToolbarContentBuilder private var viewerToolbar: some ToolbarContent {

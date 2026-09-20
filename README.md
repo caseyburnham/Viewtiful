@@ -30,7 +30,7 @@ Enable OSC in Settings. The default UDP port is **53001**. Send standard OSC bin
 | `/viewtiful/last` | None |
 | `/viewtiful/page/{page_number}` | Page number in the address, starting at 1 |
 
-Bundles execute immediately in packet order; timetags are not scheduled. Unknown commands are ignored. The listener remains active when another Mac app has focus. iPad backgrounding stops the listener; returning to the foreground restarts it.
+Bundles execute immediately in packet order; timetags are not scheduled. Unknown commands are ignored. The listener remains active when another Mac app has focus. On iPad, backgrounding stops the listener because iPadOS may suspend network work; returning to the foreground restarts it and the status is explicit while it is unavailable.
 
 Network.framework handles UDP. A small Swift OSC decoder is necessary because Apple does not ship an OSC API. Packet size, nesting, string padding, and argument boundaries are checked.
 
@@ -42,7 +42,15 @@ Program Change recall defaults to **Program 0 → Page 1**. An explicit learned 
 
 ## Validation
 
-Open `Viewtiful.xcodeproj` and run the Viewtiful scheme. The project currently targets the 27.0 Apple platforms configured in Xcode.
+When working on Cuety and Viewtiful at the same time, open the shared
+`../ShowControl.xcworkspace`. Both projects use the local `../ShowControlCore`
+package, and Xcode cannot load that same local package through two separate
+project workspaces simultaneously. Opening `Viewtiful.xcodeproj` alone is fine
+when Cuety is closed.
+
+Open `Viewtiful.xcodeproj` and run the Viewtiful scheme, or use the shared
+workspace and run its Viewtiful scheme. The project currently targets the 27.0
+Apple platforms configured in Xcode.
 
 ```sh
 swift test
@@ -50,7 +58,9 @@ xcodebuild -project Viewtiful.xcodeproj -scheme Viewtiful -destination 'platform
 xcodebuild -project Viewtiful.xcodeproj -scheme Viewtiful -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
 ```
 
-The Swift package tests the shared core; it does not replace building the Xcode app. Tests use isolated preferences and temporary PDF libraries. Coverage includes malformed OSC, bundle order, actual loopback UDP delivery/restart, MIDI learning and precedence, navigation, and restoration.
+The Swift package tests the app core and the shared `ShowControlCore` package; it does not replace building the Xcode app. Tests use isolated preferences and temporary PDF libraries. Coverage includes malformed OSC, bundle order, actual loopback UDP delivery/restart, MIDI learning and precedence, navigation, and restoration.
+
+The companion platform, identity, transport, lifecycle, accessibility, and validation contract is shared at [`../SHOW_CONTROL_COMPANION_CONTRACT.md`](../SHOW_CONTROL_COMPANION_CONTRACT.md). `ShowControlCore` contains validated OSC primitives, transport/status vocabulary, defaults, and platform-neutral tokens; PDFKit rendering, MIDI learning, QLab semantics, and document persistence remain app-specific.
 
 ## Remaining specification work
 

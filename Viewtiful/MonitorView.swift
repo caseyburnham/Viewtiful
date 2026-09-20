@@ -2,7 +2,7 @@ import SwiftUI
 
 struct MonitorView: View {
     @Bindable var midiController: MIDIController
-    @Bindable var oscController: OSCController
+    @Bindable var oscController: OSCClient
     @State private var selection = MonitorTab.midi
     @Environment(\.dismiss) private var dismiss
 
@@ -109,7 +109,7 @@ private struct MIDIActivityRow: View {
 }
 
 private struct OSCMonitorView: View {
-    @Bindable var controller: OSCController
+    @Bindable var controller: OSCClient
 
     var body: some View {
         List {

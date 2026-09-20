@@ -2,6 +2,7 @@ import Foundation
 import Network
 import Observation
 import Darwin
+import ShowControlCore
 
 enum OSCListenerStatus: Equatable, Sendable {
     case stopped
@@ -104,7 +105,7 @@ struct OSCNetworkAddress: Identifiable, Equatable, Sendable {
 
 @MainActor
 @Observable
-final class OSCController: @unchecked Sendable {
+final class OSCClient: @unchecked Sendable {
     @ObservationIgnored private let defaults: UserDefaults
 
     var enabled: Bool {
@@ -158,7 +159,7 @@ final class OSCController: @unchecked Sendable {
         senderRestrictionEnabled = defaults.bool(forKey: Keys.senderRestrictionEnabled)
         allowedSenderAddress = defaults.string(forKey: Keys.allowedSenderAddress) ?? ""
         let savedPort = defaults.integer(forKey: Keys.port)
-        port = savedPort == 0 ? 53_001 : savedPort
+        port = savedPort == 0 ? ShowControlDefaults.viewtifulOSCUDPPort : savedPort
         refreshLocalAddresses()
         startPathMonitor()
     }
@@ -310,7 +311,7 @@ final class OSCController: @unchecked Sendable {
 
     private nonisolated static func receiveMessages(
         on connection: NWConnection,
-        controller: OSCController,
+        controller: OSCClient,
         generation: UUID
     ) {
         connection.receiveMessage { [weak controller, weak connection] data, _, _, error in
@@ -377,95 +378,28 @@ final class OSCController: @unchecked Sendable {
 
 enum OSCParser {
     static func parse(_ data: Data) -> [OSCMessage]? {
-        guard data.count <= 1_048_576 else { return nil }
-        return parsePacket(Array(data), depth: 0)
-    }
-
-    private static func parsePacket(_ bytes: [UInt8], depth: Int) -> [OSCMessage]? {
-        guard depth <= 8 else { return nil }
-
-        if bytes.starts(with: Array("#bundle\0".utf8)) {
-            return parseBundle(bytes, depth: depth)
+        guard let packet = try? ShowControlOSCCodec.decode(data) else { return nil }
+        return flatten(packet).compactMap { message in
+            let arguments = message.arguments.compactMap(argument)
+            guard arguments.count == message.arguments.count else { return nil }
+            return OSCMessage(address: message.address, arguments: arguments)
         }
-
-        guard let message = parseMessage(bytes) else { return nil }
-        return [message]
     }
 
-    private static func parseBundle(_ bytes: [UInt8], depth: Int) -> [OSCMessage]? {
-        guard bytes.count >= 16 else { return nil }
-        var offset = 16
-        var messages: [OSCMessage] = []
-
-        while offset < bytes.count {
-            guard let size = readInt32(bytes, at: offset), size > 0 else { return nil }
-            offset += 4
-            let elementSize = Int(size)
-            guard elementSize <= bytes.count - offset else { return nil }
-
-            let element = Array(bytes[offset..<(offset + elementSize)])
-            if let parsed = parsePacket(element, depth: depth + 1) {
-                messages.append(contentsOf: parsed)
-            }
-            offset += elementSize
+    private static func flatten(_ packet: ShowControlOSCPacket) -> [ShowControlOSCMessage] {
+        switch packet {
+        case .message(let message): [message]
+        case .bundle(let bundle): bundle.elements.flatMap(flatten)
         }
-
-        return offset == bytes.count ? messages : nil
     }
 
-    private static func parseMessage(_ bytes: [UInt8]) -> OSCMessage? {
-        var offset = 0
-        guard
-            let address = readString(bytes, offset: &offset),
-            address.hasPrefix("/"),
-            let typeTags = readString(bytes, offset: &offset),
-            typeTags.first == ","
-        else {
-            return nil
+    private static func argument(_ value: ShowControlOSCValue) -> OSCMessage.Argument? {
+        switch value {
+        case .integer(let value): .integer(value)
+        case .float(let value): .float(value)
+        case .string(let value): .string(value)
+        case .blob, .boolean, .nilValue, .impulse, .array:
+            nil
         }
-
-        var arguments: [OSCMessage.Argument] = []
-        for tag in typeTags.dropFirst() {
-            switch tag {
-            case "i":
-                guard let value = readInt32(bytes, at: offset) else { return nil }
-                arguments.append(.integer(value))
-                offset += 4
-            case "f":
-                guard let bits = readUInt32(bytes, at: offset) else { return nil }
-                arguments.append(.float(Float(bitPattern: bits)))
-                offset += 4
-            case "s":
-                guard let value = readString(bytes, offset: &offset) else { return nil }
-                arguments.append(.string(value))
-            default:
-                return nil
-            }
-        }
-
-        guard offset == bytes.count else { return nil }
-        return OSCMessage(address: address, arguments: arguments)
-    }
-
-    private static func readString(_ bytes: [UInt8], offset: inout Int) -> String? {
-        guard offset < bytes.count, let terminator = bytes[offset...].firstIndex(of: 0) else { return nil }
-        guard let value = String(bytes: bytes[offset..<terminator], encoding: .utf8) else { return nil }
-
-        let consumed = terminator - offset + 1
-        let paddedLength = (consumed + 3) & ~3
-        guard paddedLength <= bytes.count - offset else { return nil }
-        guard bytes[terminator..<(offset + paddedLength)].allSatisfy({ $0 == 0 }) else { return nil }
-        offset += paddedLength
-        return value
-    }
-
-    private static func readInt32(_ bytes: [UInt8], at offset: Int) -> Int32? {
-        guard let value = readUInt32(bytes, at: offset) else { return nil }
-        return Int32(bitPattern: value)
-    }
-
-    private static func readUInt32(_ bytes: [UInt8], at offset: Int) -> UInt32? {
-        guard offset >= 0, offset + 4 <= bytes.count else { return nil }
-        return bytes[offset..<(offset + 4)].reduce(0) { ($0 << 8) | UInt32($1) }
     }
 }
