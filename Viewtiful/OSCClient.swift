@@ -376,8 +376,10 @@ final class OSCClient: @unchecked Sendable {
     }
 }
 
-enum OSCParser {
-    static func parse(_ data: Data) -> [OSCMessage]? {
+/// Pure packet decoding with no shared state, so it stays off the main actor
+/// and can be called from network callbacks.
+nonisolated enum OSCParser {
+    nonisolated static func parse(_ data: Data) -> [OSCMessage]? {
         guard let packet = try? ShowControlOSCCodec.decode(data) else { return nil }
         return flatten(packet).compactMap { message in
             let arguments = message.arguments.compactMap(argument)
@@ -386,14 +388,14 @@ enum OSCParser {
         }
     }
 
-    private static func flatten(_ packet: ShowControlOSCPacket) -> [ShowControlOSCMessage] {
+    private nonisolated static func flatten(_ packet: ShowControlOSCPacket) -> [ShowControlOSCMessage] {
         switch packet {
         case .message(let message): [message]
         case .bundle(let bundle): bundle.elements.flatMap(flatten)
         }
     }
 
-    private static func argument(_ value: ShowControlOSCValue) -> OSCMessage.Argument? {
+    private nonisolated static func argument(_ value: ShowControlOSCValue) -> OSCMessage.Argument? {
         switch value {
         case .integer(let value): .integer(value)
         case .float(let value): .float(value)

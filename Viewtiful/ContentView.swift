@@ -152,7 +152,7 @@ struct ContentView: View {
             documentNavigation
                 .task(id: url) { model.openDocument(at: url) }
         }
-        .documentLaunchSubtitle("Turn pages with a keyboard, MIDI, or OSC.")
+        //.documentLaunchSubtitle("xxx")
     }
     #endif
 
@@ -171,6 +171,7 @@ struct ContentView: View {
                     viewerBackground
                     PDFPageView(document: document, pageIndex: model.currentPageIndex,
                                 invertColors: model.invertPDFColors, invertAnnotations: model.invertAnnotations,
+                                reduceMotion: reduceMotion,
                                 onPageTurn: turnPage,
                                 onGoToPage: showPageEntry)
                         .accessibilityLabel("\(model.documentName), page \(model.displayedPageNumber) of \(model.pageCount)")

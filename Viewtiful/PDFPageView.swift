@@ -7,6 +7,7 @@ struct PDFPageView: NSViewRepresentable {
     let pageIndex: Int
     let invertColors: Bool
     let invertAnnotations: Bool
+    let reduceMotion: Bool
     let onPageTurn: (ViewtifulAction) -> Void
     let onGoToPage: () -> Void
 
@@ -15,7 +16,7 @@ struct PDFPageView: NSViewRepresentable {
         configure(view)
         view.onPageTurn = onPageTurn
         view.onGoToPage = onGoToPage
-        update(view, cache: context.coordinator)
+        update(view, cache: context.coordinator, reduceMotion: reduceMotion)
         return view
     }
 
@@ -24,7 +25,7 @@ struct PDFPageView: NSViewRepresentable {
         view.onGoToPage = onGoToPage
         if context.coordinator.source !== document { view.needsWindowFit = true }
         let previousPage = view.currentPage
-        update(view, cache: context.coordinator)
+        update(view, cache: context.coordinator, reduceMotion: reduceMotion)
         view.fitWindowIfNeeded()
         // PDFKit rebuilds its annotation layers for each page it lays out, so only a
         // page that actually changed needs the sweep. Updates that leave the page
@@ -37,11 +38,17 @@ struct PDFPageView: NSViewRepresentable {
 
 /// PDFKit owns rendering and accessibility. The show viewer owns page navigation.
 final class ShowPDFView: PDFView, PDFViewDelegate {
+    private static let pageTransitionRevealDelay = 0.08
+    private static let pageTransitionFadeDuration = 0.18
+
     var onPageTurn: ((ViewtifulAction) -> Void)?
     var onGoToPage: (() -> Void)?
     var needsWindowFit = true
     private var scrollNavigation = ScrollPageNavigation()
     private var pendingAnnotationScalePasses = 0
+    private var pageTransitionOverlay: PageTransitionImageView?
+    private var pageTransitionWorkItem: DispatchWorkItem?
+    private var pageTransitionGeneration = 0
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -160,6 +167,7 @@ final class ShowPDFView: PDFView, PDFViewDelegate {
         super.layout()
         // PDFKit reserves the titlebar's space again as it lays the page out.
         clearContentInsets()
+        pageTransitionOverlay?.frame = bounds
         if needsWindowFit {
             DispatchQueue.main.async { [weak self] in self?.fitWindowIfNeeded() }
         }
@@ -223,6 +231,68 @@ final class ShowPDFView: PDFView, PDFViewDelegate {
         return corrected
     }
 
+    /// PDFKit paints the new page progressively: a coarse tile can be visible for
+    /// a frame before the final tile arrives. Keep the already-sharp outgoing page
+    /// over that handoff, then reveal the new page with a short native fade.
+    func showPage(_ page: PDFPage, animated: Bool) {
+        pageTransitionGeneration &+= 1
+        let generation = pageTransitionGeneration
+        pageTransitionWorkItem?.cancel()
+        pageTransitionWorkItem = nil
+
+        if animated, let snapshot = pageTransitionSnapshot() {
+            let overlay = pageTransitionOverlay ?? PageTransitionImageView(frame: bounds)
+            overlay.image = snapshot
+            overlay.frame = bounds
+            overlay.alphaValue = 1
+            overlay.isHidden = false
+            addSubview(overlay, positioned: .above, relativeTo: nil)
+            pageTransitionOverlay = overlay
+        } else {
+            clearPageTransitionOverlay()
+        }
+
+        go(to: page)
+
+        guard animated, let overlay = pageTransitionOverlay else { return }
+        let workItem = DispatchWorkItem { [weak self, weak overlay] in
+            guard let self, let overlay else { return }
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = Self.pageTransitionFadeDuration
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                overlay.animator().alphaValue = 0
+            } completionHandler: { [weak self, weak overlay] in
+                guard let self, let overlay else { return }
+                if self.pageTransitionGeneration == generation,
+                   self.pageTransitionOverlay === overlay {
+                    self.clearPageTransitionOverlay()
+                }
+            }
+        }
+        pageTransitionWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.pageTransitionRevealDelay,
+            execute: workItem
+        )
+    }
+
+    private func pageTransitionSnapshot() -> NSImage? {
+        guard bounds.width > 0, bounds.height > 0 else { return nil }
+        pageTransitionOverlay?.isHidden = true
+        displayIfNeeded()
+        guard let representation = bitmapImageRepForCachingDisplay(in: bounds) else { return nil }
+        cacheDisplay(in: bounds, to: representation)
+        let image = NSImage(size: bounds.size)
+        image.addRepresentation(representation)
+        return image
+    }
+
+    private func clearPageTransitionOverlay() {
+        pageTransitionOverlay?.removeFromSuperview()
+        pageTransitionOverlay?.image = nil
+        pageTransitionOverlay = nil
+    }
+
     func fitWindowIfNeeded() {
         guard needsWindowFit, bounds.height > 0, let window,
               let page = currentPage, let screen = window.screen else { return }
@@ -239,6 +309,14 @@ final class ShowPDFView: PDFView, PDFViewDelegate {
         frame.origin.x = min(max(frame.minX, screen.visibleFrame.minX), screen.visibleFrame.maxX - width)
         window.setFrame(frame, display: true, animate: !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
     }
+
+    deinit {
+        pageTransitionWorkItem?.cancel()
+    }
+}
+
+private final class PageTransitionImageView: NSImageView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 #else
 struct PDFPageView: UIViewRepresentable {
@@ -246,23 +324,31 @@ struct PDFPageView: UIViewRepresentable {
     let pageIndex: Int
     let invertColors: Bool
     let invertAnnotations: Bool
+    let reduceMotion: Bool
     let onPageTurn: (ViewtifulAction) -> Void
     let onGoToPage: () -> Void
 
     func makeUIView(context: Context) -> FitPDFView {
         let view = FitPDFView()
         configure(view)
-        update(view, cache: context.coordinator)
+        update(view, cache: context.coordinator, reduceMotion: reduceMotion)
         return view
     }
 
     func updateUIView(_ view: FitPDFView, context: Context) {
-        update(view, cache: context.coordinator)
+        update(view, cache: context.coordinator, reduceMotion: reduceMotion)
     }
 }
 
 /// Zooming is off: the page is always drawn at the largest scale that fits the view.
 final class FitPDFView: PDFView, PDFViewDelegate {
+    private static let pageTransitionRevealDelay = 0.08
+    private static let pageTransitionFadeDuration = 0.18
+
+    private var pageTransitionOverlay: UIImageView?
+    private var pageTransitionWorkItem: DispatchWorkItem?
+    private var pageTransitionGeneration = 0
+
     /// Walk from PDFKit's public document view to its containing scroll view.
     var contentScrollView: UIScrollView? {
         var ancestor = documentView?.superview
@@ -293,6 +379,7 @@ final class FitPDFView: PDFView, PDFViewDelegate {
         preventToolbarInsets()
         super.layoutSubviews()
         preventToolbarInsets()
+        pageTransitionOverlay?.frame = bounds
         // PDFKit rebuilds its scrolling machinery as pages lay out, so sweep each pass.
         disableZoomGestures(in: self)
     }
@@ -335,6 +422,81 @@ final class FitPDFView: PDFView, PDFViewDelegate {
         }
         for subview in view.subviews { disableZoomGestures(in: subview) }
     }
+
+    /// PDFKit paints the new page progressively: a coarse tile can be visible for
+    /// a frame before the final tile arrives. Keep the already-sharp outgoing page
+    /// over that handoff, then reveal the new page with a short native fade.
+    func showPage(_ page: PDFPage, animated: Bool) {
+        pageTransitionGeneration &+= 1
+        let generation = pageTransitionGeneration
+        pageTransitionWorkItem?.cancel()
+        pageTransitionWorkItem = nil
+
+        if animated, let snapshot = pageTransitionSnapshot() {
+            let overlay = pageTransitionOverlay ?? UIImageView(frame: bounds)
+            overlay.image = snapshot
+            overlay.frame = bounds
+            overlay.alpha = 1
+            overlay.isHidden = false
+            overlay.isUserInteractionEnabled = false
+            if overlay.superview !== self {
+                addSubview(overlay)
+            } else {
+                bringSubviewToFront(overlay)
+            }
+            pageTransitionOverlay = overlay
+        } else {
+            clearPageTransitionOverlay()
+        }
+
+        go(to: page)
+
+        guard animated, let overlay = pageTransitionOverlay else { return }
+        let workItem = DispatchWorkItem { [weak self, weak overlay] in
+            guard let self, let overlay else { return }
+            UIView.animate(
+                withDuration: Self.pageTransitionFadeDuration,
+                delay: 0,
+                options: [.beginFromCurrentState, .curveEaseInOut, .allowUserInteraction]
+            ) {
+                overlay.alpha = 0
+            } completion: { [weak self, weak overlay] _ in
+                guard let self, let overlay else { return }
+                if self.pageTransitionGeneration == generation,
+                   self.pageTransitionOverlay === overlay {
+                    self.clearPageTransitionOverlay()
+                }
+            }
+        }
+        pageTransitionWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.pageTransitionRevealDelay,
+            execute: workItem
+        )
+    }
+
+    private func pageTransitionSnapshot() -> UIImage? {
+        guard bounds.width > 0, bounds.height > 0 else { return nil }
+        pageTransitionOverlay?.isHidden = true
+        layoutIfNeeded()
+        // Derive the scale from this view's traits so the snapshot matches the
+        // display it is actually on, rather than assuming the main screen.
+        let format = UIGraphicsImageRendererFormat(for: traitCollection)
+        format.opaque = true
+        return UIGraphicsImageRenderer(bounds: bounds, format: format).image { context in
+            layer.render(in: context.cgContext)
+        }
+    }
+
+    private func clearPageTransitionOverlay() {
+        pageTransitionOverlay?.removeFromSuperview()
+        pageTransitionOverlay?.image = nil
+        pageTransitionOverlay = nil
+    }
+
+    deinit {
+        pageTransitionWorkItem?.cancel()
+    }
 }
 #endif
 
@@ -352,7 +514,7 @@ extension PDFPageView {
     /// to do with the page — a toolbar fading in, the pointer moving. Every assignment
     /// here is therefore guarded: PDFKit relays out the document and redraws the page
     /// when these are set, even when set to the value they already hold.
-    func update(_ view: PDFView, cache: PDFDisplayCache) {
+    func update(_ view: PDFView, cache: PDFDisplayCache, reduceMotion: Bool) {
         if view.pageShadowsEnabled { view.pageShadowsEnabled = false }
         #if os(macOS)
         let background: NSColor = invertColors ? .black : .windowBackgroundColor
@@ -362,10 +524,24 @@ extension PDFPageView {
         if view.backgroundColor != background { view.backgroundColor = background }
         let displayed = cache.document(source: document, pageIndex: pageIndex,
                                        inverted: invertColors, invertAnnotations: invertAnnotations)
-        if view.document !== displayed { view.document = displayed }
+        let sameDisplayedDocument = view.document === displayed
+        if !sameDisplayedDocument { view.document = displayed }
         let index = displayed === document ? pageIndex : cache.renderedPageIndex(for: pageIndex) ?? 0
         if let page = displayed.page(at: index), view.currentPage !== page {
-            view.go(to: page)
+            let isPageTurn = sameDisplayedDocument && view.currentPage != nil
+#if os(macOS)
+            if let view = view as? ShowPDFView {
+                view.showPage(page, animated: isPageTurn && !reduceMotion)
+            } else {
+                view.go(to: page)
+            }
+#else
+            if let view = view as? FitPDFView {
+                view.showPage(page, animated: isPageTurn && !reduceMotion)
+            } else {
+                view.go(to: page)
+            }
+#endif
         }
         // The page always scales to the window; there is no manual zoom to preserve.
         // Assigning this rescales the page, so it is only restored if something
