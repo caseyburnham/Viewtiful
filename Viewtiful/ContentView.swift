@@ -13,10 +13,11 @@ struct ContentView: View {
     @Bindable var model: ViewerModel
     @Bindable var oscController: OSCClient
     @Bindable var midiController: MIDIController
+    @Bindable var activityLog: ActivityLog
     @State private var screenAwakeController = ScreenAwakeController()
     @State private var isChoosingDocument = false
     @State private var isShowingSettings = false
-    @State private var isShowingMonitor = false
+    @State private var isShowingActivityLog = false
     @State private var isShowingPageEntry = false
     @State private var isShowingPageNumbering = false
     @State private var controlsVisible = false
@@ -36,8 +37,8 @@ struct ContentView: View {
         .sheet(isPresented: $isShowingSettings) {
             GeneralSettingsView(model: model, oscController: oscController, midiController: midiController)
         }
-        .sheet(isPresented: $isShowingMonitor) {
-            MonitorView(midiController: midiController, oscController: oscController)
+        .sheet(isPresented: $isShowingActivityLog) {
+            ActivityLogView(log: activityLog)
         }
         .sheet(isPresented: $isShowingPageNumbering) {
             PageOffsetSheet(model: model)
@@ -66,7 +67,7 @@ struct ContentView: View {
             recentDocuments: model.recentDocuments,
             openRecentDocument: model.openRecentDocument,
             clearRecentDocuments: model.clearRecentDocuments,
-            showMonitors: showMonitors,
+            showActivityLog: showActivityLog,
             goToPage: showPageEntry,
             controlsVisible: controlsVisible,
             toggleControls: toggleControls,
@@ -242,7 +243,7 @@ struct ContentView: View {
         .focusable()
         .focusEffectDisabled()
         .onKeyPress(phases: .down) { key in
-            guard !isShowingSettings, !isShowingMonitor, !isChoosingDocument, !isShowingPageEntry,
+            guard !isShowingSettings, !isShowingActivityLog, !isChoosingDocument, !isShowingPageEntry,
                   !isShowingPageNumbering,
                   key.modifiers.intersection([.command, .control, .option]).isEmpty else { return .ignored }
             switch key.key {
@@ -329,9 +330,9 @@ struct ContentView: View {
         }
         ToolbarSpacer(.fixed)
         ToolbarItem(placement: .primaryAction) {
-            Button("Monitors", systemImage: "waveform.path.ecg", action: showMonitors)
+            Button("Activity Log", systemImage: "waveform.path.ecg", action: showActivityLog)
                 .buttonBorderShape(.circle)
-                .help("Open MIDI and OSC monitors (Command-Shift-M)")
+                .help("Open the MIDI and OSC activity log (Command-Shift-M)")
                 .fadesWithControls(controlsVisible, animation: controlsAnimation)
         }
         ToolbarSpacer(.fixed)
@@ -490,11 +491,11 @@ struct ContentView: View {
         isShowingPageEntry = true
     }
 
-    private func showMonitors() {
+    private func showActivityLog() {
         #if os(macOS)
-        openWindow(id: "monitors")
+        openWindow(id: "activity-log")
         #else
-        isShowingMonitor = true
+        isShowingActivityLog = true
         #endif
     }
 
@@ -737,7 +738,7 @@ struct ViewerCommandActions {
     let recentDocuments: [RecentDocument]
     let openRecentDocument: (RecentDocument) -> Void
     let clearRecentDocuments: () -> Void
-    let showMonitors: () -> Void
+    let showActivityLog: () -> Void
     let goToPage: () -> Void
     let controlsVisible: Bool
     let toggleControls: () -> Void
@@ -803,7 +804,7 @@ struct ViewerCommands: Commands {
             Button(viewer?.controlsVisible == false ? "Show Controls" : "Hide Controls") { viewer?.toggleControls() }
                 .keyboardShortcut("t", modifiers: [.command, .option])
                 .disabled(viewer?.hasDocument != true)
-            Button("Show Monitors") { viewer?.showMonitors() }
+            Button("Show Activity Log") { viewer?.showActivityLog() }
                 .keyboardShortcut("m", modifiers: [.command, .shift])
         }
     }

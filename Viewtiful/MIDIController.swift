@@ -144,6 +144,16 @@ struct MIDIActivity: Identifiable, Equatable, Sendable {
         kind == .programChange ? byte1 : byte2
     }
 
+    /// How the message reads in the Activity Log.
+    var logMessage: String {
+        "\(kind.displayName) \(byte1)"
+    }
+
+    var logDetails: String {
+        kind == .programChange
+            ? "Channel \(channel + 1)  ·  Program \(byte1)"
+            : "Channel \(channel + 1)  ·  Byte 1 \(byte1)  ·  Byte 2 \(byte2)"
+    }
 }
 
 @MainActor
@@ -192,9 +202,9 @@ final class MIDIController: @unchecked Sendable {
     private(set) var bindings: [MIDINavigationAction: MIDITrigger] = [:]
     private(set) var learningAction: MIDINavigationAction?
     private(set) var lastActivity: MIDIActivity?
-    private(set) var activityHistory: [MIDIActivity] = []
     private(set) var setupError: String?
 
+    @ObservationIgnored private let log: ActivityLog?
     @ObservationIgnored var onAction: ((ViewtifulAction) -> Void)?
     @ObservationIgnored private var client = MIDIClientRef()
     @ObservationIgnored private var inputPort = MIDIPortRef()
@@ -203,8 +213,9 @@ final class MIDIController: @unchecked Sendable {
     @ObservationIgnored private var activeCCs: Set<CCKey> = []
     @ObservationIgnored private var inputGeneration: UInt64 = 0
 
-    init(defaults: UserDefaults = .standard, connectsToDevices: Bool = true) {
+    init(defaults: UserDefaults = .standard, connectsToDevices: Bool = true, log: ActivityLog? = nil) {
         self.defaults = defaults
+        self.log = log
         enabled = defaults.object(forKey: Keys.enabled) as? Bool ?? true
         channelFilter = defaults.integer(forKey: Keys.channelFilter)
         acceptsAllSources = defaults.object(forKey: Keys.acceptsAllSources) as? Bool ?? true
@@ -392,10 +403,15 @@ final class MIDIController: @unchecked Sendable {
     func process(_ activity: MIDIActivity) {
         guard enabled else { return }
         lastActivity = activity
-        activityHistory.insert(activity, at: 0)
-        if activityHistory.count > 200 { activityHistory.removeLast() }
-        guard acceptsAllSources || selectedSourceIDs.contains(activity.sourceID) else { return }
-        guard channelFilter == 0 || channelFilter == Int(activity.channel) + 1 else { return }
+
+        guard acceptsAllSources || selectedSourceIDs.contains(activity.sourceID) else {
+            record(activity, status: .ignored("Source is not selected"))
+            return
+        }
+        guard channelFilter == 0 || channelFilter == Int(activity.channel) + 1 else {
+            record(activity, status: .ignored("Channel \(channelFilter) only"))
+            return
+        }
 
         let trigger = MIDITrigger(
             kind: activity.kind,
@@ -405,44 +421,75 @@ final class MIDIController: @unchecked Sendable {
         )
 
         if let learningAction {
-            guard shouldTrigger(activity, allowUnboundControlChange: true) else { return }
+            if let reason = rejectionReason(for: activity, allowUnboundControlChange: true) {
+                record(activity, status: .ignored(reason))
+                return
+            }
             // One physical control must produce one navigation action.
             replaceBinding(learningAction, with: trigger)
             self.learningAction = nil
+            record(activity, status: .triggered("Captured \(learningAction.title)"))
             return
         }
 
-        guard shouldTrigger(activity, allowUnboundControlChange: false) else { return }
+        if let reason = rejectionReason(for: activity, allowUnboundControlChange: false) {
+            record(activity, status: .ignored(reason))
+            return
+        }
 
         for action in MIDINavigationAction.allCases where bindings[action]?.matches(activity) == true {
+            record(activity, status: .triggered(action.title))
             onAction?(action.viewtifulAction)
             return
         }
 
         if programChangeRecallEnabled, activity.kind == .programChange {
             let page = Int(activity.byte1) + programChangeOffset
-            guard page > 0 else { return }
+            guard page > 0 else {
+                record(activity, status: .invalid(
+                    "Program \(activity.byte1) with offset \(programChangeOffset) is page \(page)"
+                ))
+                return
+            }
+            record(activity, status: .triggered(ViewtifulAction.goToPage(page).title))
             onAction?(.goToPage(page))
+            return
         }
+
+        record(activity, status: .ignored("No mapping"))
     }
 
-    private func shouldTrigger(_ activity: MIDIActivity, allowUnboundControlChange: Bool) -> Bool {
+    private func record(_ activity: MIDIActivity, status: ActivityEntry.Status) {
+        log?.record(ActivityEntry(
+            timestamp: activity.received,
+            source: .midi,
+            status: status,
+            message: activity.logMessage,
+            details: activity.logDetails,
+            origin: activity.source
+        ))
+    }
+
+    /// Why the message will not fire an action, or `nil` when it should. The
+    /// reason doubles as the Activity Log's account of what happened, so the
+    /// decision is made once whether or not anyone is watching the log.
+    private func rejectionReason(for activity: MIDIActivity, allowUnboundControlChange: Bool) -> String? {
         switch activity.kind {
         case .note:
-            return activity.value > 0
+            return activity.value > 0 ? nil : "Note released"
         case .programChange:
-            return true
+            return nil
         case .controlChange:
             let key = CCKey(sourceID: activity.sourceID, channel: activity.channel,
                             controller: activity.number)
             if activity.value == 0 {
                 activeCCs.remove(key)
-                return false
+                return "Control released"
             }
             if !allowUnboundControlChange && !hasBindingMatch(for: activity) {
-                return false
+                return "No mapping"
             }
-            return activeCCs.insert(key).inserted
+            return activeCCs.insert(key).inserted ? nil : "Control already held"
         }
     }
 

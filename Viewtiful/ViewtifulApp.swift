@@ -4,8 +4,8 @@ import AppKit
 
 /// Viewtiful's Mac scenes are single explicitly-opened windows rather than a document
 /// group, so closing the viewer leaves nothing to return to and no reason to keep the
-/// app running. Settings and Monitors are windows in their own right, so the app still
-/// stays up while either of those is open.
+/// app running. Settings and the Activity Log are windows in their own right, so the
+/// app still stays up while either of those is open.
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -22,13 +22,24 @@ struct ViewtifulApp: App {
     #endif
     @Environment(\.openWindow) private var openWindow
     @State private var model = ViewerModel()
-    @State private var oscController = OSCClient()
-    @State private var midiController = MIDIController()
+    @State private var activityLog: ActivityLog
+    @State private var oscController: OSCClient
+    @State private var midiController: MIDIController
+
+    init() {
+        // Both controllers report to the one log, so the Activity Log window
+        // shows MIDI and OSC in the order they actually arrived.
+        let log = ActivityLog()
+        _activityLog = State(initialValue: log)
+        _oscController = State(initialValue: OSCClient(log: log))
+        _midiController = State(initialValue: MIDIController(log: log))
+    }
 
     var body: some Scene {
         #if os(macOS)
         Window("Viewtiful", id: "viewer") {
-            ContentView(model: model, oscController: oscController, midiController: midiController)
+            ContentView(model: model, oscController: oscController, midiController: midiController,
+                        activityLog: activityLog)
                 .frame(minWidth: 360, minHeight: 480)
         }
         .defaultSize(width: 960, height: 720)
@@ -41,14 +52,15 @@ struct ViewtifulApp: App {
             )
         }
 
-        Window("Monitors", id: "monitors") {
-            MonitorView(midiController: midiController, oscController: oscController)
+        Window("Activity Log", id: "activity-log") {
+            ActivityLogView(log: activityLog)
         }
-        .defaultSize(width: 720, height: 520)
+        .defaultSize(width: 820, height: 480)
         .windowResizability(.contentMinSize)
         #else
         WindowGroup {
-            ContentView(model: model, oscController: oscController, midiController: midiController)
+            ContentView(model: model, oscController: oscController, midiController: midiController,
+                        activityLog: activityLog)
         }
 
         #endif

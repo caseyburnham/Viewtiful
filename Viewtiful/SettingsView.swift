@@ -385,7 +385,7 @@ private struct OSCSettingsForm: View {
 
     var body: some View {
         Form {
-            Section("Listener") {
+            Section {
                 Toggle("Enable OSC", isOn: $controller.enabled)
 
                 LabeledContent("Device IP Address") {
@@ -430,13 +430,13 @@ private struct OSCSettingsForm: View {
                         .keyboardType(.numberPad)
                         #endif
                 }
-
+            } header: {
+                Text("Listener")
+            } footer: {
                 Text("Send OSC over UDP to one of the addresses above on the selected port.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
             }
 
-            Section("Sender Restriction") {
+            Section {
                 Toggle("Restrict to One Sender", isOn: $controller.senderRestrictionEnabled)
 
                 if controller.senderRestrictionEnabled {
@@ -447,14 +447,14 @@ private struct OSCSettingsForm: View {
                         .textInputAutocapitalization(.never)
                         .keyboardType(.numbersAndPunctuation)
                         #endif
-
+                }
+            } header: {
+                Text("Sender Restriction")
+            } footer: {
+                if controller.senderRestrictionEnabled {
                     Text("Only commands from this exact IP address are accepted. Leave it blank only while configuring; no sender is accepted until an address is entered.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
                 } else {
                     Text("Viewtiful accepts OSC commands from any sender on the local network.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
                 }
             }
 

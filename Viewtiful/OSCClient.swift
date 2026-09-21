@@ -42,6 +42,10 @@ struct OSCMessage: Equatable, Sendable {
     let address: String
     let arguments: [Argument]
 
+    var argumentSummary: String {
+        arguments.map(\.description).joined(separator: ", ")
+    }
+
     var action: ViewtifulAction? {
         if arguments.isEmpty {
             let pagePrefix = "/viewtiful/page/"
@@ -84,17 +88,23 @@ struct OSCMessage: Equatable, Sendable {
     }
 }
 
-struct OSCActivity: Identifiable, Equatable, Sendable {
-    let id: UUID
-    let message: OSCMessage
-    let sender: String
-    let received: Date
+/// A message lifted out of a packet, whether or not Viewtiful can read it.
+enum OSCParsedMessage: Equatable, Sendable {
+    case message(OSCMessage)
+    case unsupported(address: String, argumentTypes: String)
 
-    init(message: OSCMessage, sender: String, received: Date = .now) {
-        id = UUID()
-        self.message = message
-        self.sender = sender
-        self.received = received
+    var address: String {
+        switch self {
+        case .message(let message): message.address
+        case .unsupported(let address, _): address
+        }
+    }
+
+    var argumentSummary: String {
+        switch self {
+        case .message(let message): message.argumentSummary
+        case .unsupported(_, let argumentTypes): argumentTypes
+        }
     }
 }
 
@@ -137,15 +147,9 @@ final class OSCClient: @unchecked Sendable {
     }
 
     private(set) var status: OSCListenerStatus = .stopped
-    private(set) var messageHistory: [OSCActivity] = []
-    private(set) var malformedPacketCount = 0
-    private(set) var blockedPacketCount = 0
     private(set) var localAddresses: [OSCNetworkAddress] = []
 
-    var rejectedPacketCount: Int {
-        malformedPacketCount + blockedPacketCount
-    }
-
+    @ObservationIgnored private let log: ActivityLog?
     @ObservationIgnored var onAction: ((ViewtifulAction) -> Void)?
     @ObservationIgnored private var isAvailable = false
     @ObservationIgnored private var generation = UUID()
@@ -155,8 +159,9 @@ final class OSCClient: @unchecked Sendable {
     @ObservationIgnored private var pathMonitor: NWPathMonitor?
     @ObservationIgnored private let queue = DispatchQueue(label: "Viewtiful.OSC", qos: .userInitiated)
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, log: ActivityLog? = nil) {
         self.defaults = defaults
+        self.log = log
         enabled = defaults.object(forKey: Keys.enabled) as? Bool ?? true
         senderRestrictionEnabled = defaults.bool(forKey: Keys.senderRestrictionEnabled)
         allowedSenderAddress = defaults.string(forKey: Keys.allowedSenderAddress) ?? ""
@@ -325,11 +330,9 @@ final class OSCClient: @unchecked Sendable {
                     return
                 }
                 if let data, !data.isEmpty {
-                    let messages = OSCParser.parse(data)
                     controller.record(
-                        messages: messages,
-                        sender: senderAddress(for: connection.endpoint),
-                        packetWasValid: messages != nil
+                        messages: OSCParser.parse(data),
+                        sender: senderAddress(for: connection.endpoint)
                     )
                 }
                 if error == nil {
@@ -349,22 +352,62 @@ final class OSCClient: @unchecked Sendable {
         return String(describing: host)
     }
 
-    private func record(messages: [OSCMessage]?, sender: String, packetWasValid: Bool) {
-        guard packetWasValid, let messages else {
-            malformedPacketCount += 1
+    private func record(messages: [OSCParsedMessage]?, sender: String) {
+        guard let messages else {
+            // Nothing survived decoding, so the packet is logged as the one
+            // thing known about it: that it arrived and could not be read.
+            log?.record(ActivityEntry(
+                source: .osc,
+                status: .invalid("Not a readable OSC packet"),
+                message: "Undecodable Packet",
+                origin: sender
+            ))
             return
         }
 
-        guard !senderRestrictionEnabled || sender == allowedSenderAddress.trimmingCharacters(in: .whitespacesAndNewlines) else {
-            blockedPacketCount += 1
+        let allowedSender = allowedSenderAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !senderRestrictionEnabled || sender == allowedSender else {
+            let reason = allowedSender.isEmpty
+                ? "Blocked: no allowed sender is set"
+                : "Blocked: only \(allowedSender) is allowed"
+            for parsed in messages {
+                log?.record(ActivityEntry(
+                    source: .osc,
+                    status: .invalid(reason),
+                    message: parsed.address,
+                    details: parsed.argumentSummary,
+                    origin: sender
+                ))
+            }
             return
         }
 
-        for message in messages {
-            let activity = OSCActivity(message: message, sender: sender)
-            messageHistory.insert(activity, at: 0)
-            if messageHistory.count > 200 { messageHistory.removeLast() }
-            if let action = message.action {
+        for parsed in messages {
+            guard case .message(let message) = parsed else {
+                log?.record(ActivityEntry(
+                    source: .osc,
+                    status: .invalid("Argument type is not supported"),
+                    message: parsed.address,
+                    details: parsed.argumentSummary,
+                    origin: sender
+                ))
+                continue
+            }
+
+            let action = message.action
+            let status: ActivityEntry.Status = if let action {
+                .triggered(action.title)
+            } else {
+                .invalid("Not a valid command")
+            }
+            log?.record(ActivityEntry(
+                source: .osc,
+                status: status,
+                message: message.address,
+                details: message.argumentSummary,
+                origin: sender
+            ))
+            if let action {
                 onAction?(action)
             }
         }
@@ -381,12 +424,32 @@ final class OSCClient: @unchecked Sendable {
 /// Pure packet decoding with no shared state, so it stays off the main actor
 /// and can be called from network callbacks.
 nonisolated enum OSCParser {
-    nonisolated static func parse(_ data: Data) -> [OSCMessage]? {
+    nonisolated static func parse(_ data: Data) -> [OSCParsedMessage]? {
         guard let packet = try? ShowControlOSCCodec.decode(data) else { return nil }
-        return flatten(packet).compactMap { message in
+        return flatten(packet).map { message in
             let arguments = message.arguments.compactMap(argument)
-            guard arguments.count == message.arguments.count else { return nil }
-            return OSCMessage(address: message.address, arguments: arguments)
+            guard arguments.count == message.arguments.count else {
+                // Kept rather than dropped: a message carrying argument types
+                // this app cannot read is the kind of mistake worth showing.
+                return .unsupported(
+                    address: message.address,
+                    argumentTypes: message.arguments.map(typeName).joined(separator: ", ")
+                )
+            }
+            return .message(OSCMessage(address: message.address, arguments: arguments))
+        }
+    }
+
+    private nonisolated static func typeName(_ value: ShowControlOSCValue) -> String {
+        switch value {
+        case .integer: "integer"
+        case .float: "float"
+        case .string: "string"
+        case .blob: "blob"
+        case .boolean: "boolean"
+        case .nilValue: "nil"
+        case .impulse: "impulse"
+        case .array: "array"
         }
     }
 

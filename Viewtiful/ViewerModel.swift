@@ -360,6 +360,7 @@ final class ViewerModel {
         openRecentDocument(lastDocument)
     }
 
+
     func closeDocument() {
         flushPendingPersistence()
         relinquishAccess()

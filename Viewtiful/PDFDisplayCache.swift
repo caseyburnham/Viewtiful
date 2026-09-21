@@ -18,7 +18,7 @@ final class PDFDisplayCache {
     private static let maxRenderedPages = 64
     /// Large enough that PDFKit parses the page's content stream and fonts for real,
     /// which is the slow half of drawing it, without paying for a full rasterization.
-    private static let warmupSize = CGSize(width: 512, height: 512)
+    private nonisolated static let warmupSize = CGSize(width: 512, height: 512)
 
     /// PDFKit renders its own page tiles off the main thread while a document is on
     /// screen, so reading a page from this queue is an access it already makes itself.
@@ -203,52 +203,9 @@ final class PDFDisplayCache {
 
     // MARK: - Drawing an inverted copy
 
-    private static func drawAnnotations(_ annotations: [PDFAnnotation], in context: CGContext) {
-        for annotation in annotations where annotation.shouldDisplay {
-            context.saveGState()
-            if annotation.type == "Highlight" {
-                drawHighlight(annotation, in: context)
-            } else {
-                annotation.draw(with: .cropBox, in: context)
-            }
-            context.restoreGState()
-        }
-    }
-
-    private static func drawHighlight(_ annotation: PDFAnnotation, in context: CGContext) {
-        // PDF highlight appearance streams commonly use an opaque Multiply
-        // fill. That is legible on a white page, but can hide the inverted
-        // page's light text. Rebuild the markup from its quads with a normal,
-        // translucent fill so the display copy remains readable.
-        context.setBlendMode(.normal)
-        context.setAlpha(0.35)
-        context.setFillColor(annotation.color.cgColor)
-
-        let points = annotation.quadrilateralPoints ?? []
-        if points.count >= 4 {
-            for quad in stride(from: 0, to: points.count - 3, by: 4) {
-                let path = CGMutablePath()
-                func point(at index: Int) -> CGPoint {
-                    var value = CGPoint.zero
-                    points[index].getValue(&value)
-                    return CGPoint(x: annotation.bounds.minX + value.x, y: annotation.bounds.minY + value.y)
-                }
-                path.move(to: point(at: quad))
-                path.addLine(to: point(at: quad + 1))
-                path.addLine(to: point(at: quad + 3))
-                path.addLine(to: point(at: quad + 2))
-                path.closeSubpath()
-                context.addPath(path)
-                context.fillPath()
-            }
-        } else {
-            context.fill(annotation.bounds)
-        }
-    }
-
     /// Returns a one-page PDF of the inverted page. The result is data rather than a
     /// document so it can cross back from the render queue as a value.
-    static func render(_ original: PDFPage, invertAnnotations: Bool) -> Data? {
+    nonisolated static func render(_ original: PDFPage, invertAnnotations: Bool) -> Data? {
         guard let data = original.dataRepresentation,
               let copy = PDFDocument(data: data), let page = copy.page(at: 0) else { return nil }
         let annotations = page.annotations
@@ -271,7 +228,9 @@ final class PDFDisplayCache {
         context.saveGState()
         context.concatenate(transform)
         context.drawPDFPage(reference)
-        if invertAnnotations && original.displaysAnnotations { drawAnnotations(annotations, in: context) }
+        if invertAnnotations && original.displaysAnnotations {
+            PDFAnnotationDrawing.draw(annotations, box: .cropBox, in: context)
+        }
         context.restoreGState()
         context.saveGState()
         context.setBlendMode(.difference)
@@ -282,7 +241,7 @@ final class PDFDisplayCache {
         if !invertAnnotations && original.displaysAnnotations {
             context.saveGState()
             context.concatenate(transform)
-            drawAnnotations(annotations, in: context)
+            PDFAnnotationDrawing.draw(annotations, box: .cropBox, in: context)
             context.restoreGState()
         }
         context.endPDFPage()
