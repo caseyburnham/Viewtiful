@@ -197,7 +197,7 @@ private struct MIDISettingsSection: View {
         } header: {
             Text("Program Change Page Recall")
         } footer: {
-            Text("Page = Program + Offset. Program Change values are zero-based; use offset 1 for Program 0 → Page 1.")
+            Text("PDF page = Program + Offset. Program Change values are zero-based; use offset 1 for Program 0 → the first page of the PDF. This counts from the front of the PDF and ignores the document's page offset, so the two do not stack.")
         }
 
     }
@@ -296,6 +296,18 @@ private struct GeneralSettingsForm: View {
             }
 
             Section {
+                Picker("Margin", selection: $model.pageMargin) {
+                    ForEach(PageMargin.allCases) { margin in
+                        Text(margin.displayName).tag(margin)
+                    }
+                }
+            } header: {
+                Text("Margin")
+            } footer: {
+                Text("Leaves a border around the page instead of filling the screen edge to edge. The border matches the page: white normally, black when pages are inverted.")
+            }
+
+            Section {
                 Toggle("Keep Screen Awake", isOn: $model.keepScreenAwake)
             } header: {
                 Text("During a Show")
@@ -310,6 +322,60 @@ private struct GeneralSettingsForm: View {
             } footer: {
                 Text("Tap an edge to turn a page. Tap the center to show or hide controls. You can also swipe or use a keyboard, MIDI, or OSC.")
             }
+
+            RecentDocumentsSection(model: model)
+        }
+    }
+}
+
+private struct RecentDocumentsSection: View {
+    @Bindable var model: ViewerModel
+
+    var body: some View {
+        Section {
+            if model.recentDocuments.isEmpty {
+                Text("No recent documents.")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(model.recentDocuments) { recent in
+                    row(for: recent)
+                }
+                .onDelete(perform: remove)
+
+                Button("Clear Recent Documents", role: .destructive) {
+                    model.clearRecentDocuments()
+                }
+            }
+        } header: {
+            Text("Recent Documents")
+        } footer: {
+            Text("Viewtiful remembers where each document is, the page it was left on, and its page offset. Removing one forgets that, not the file itself. The open document is always kept.")
+        }
+    }
+
+    private func row(for recent: RecentDocument) -> some View {
+        LabeledContent {
+            if !model.canRemoveRecentDocument(recent) {
+                Text("Open")
+                    .foregroundStyle(.secondary)
+            }
+        } label: {
+            Text(recent.displayName)
+            Text(recent.lastOpened, format: .relative(presentation: .named))
+        }
+        // Swiping covers iPad; the Mac has no swipe, so the same action is offered
+        // where a Mac list expects to find it.
+        .contextMenu {
+            Button("Remove", role: .destructive) { model.removeRecentDocument(recent) }
+                .disabled(!model.canRemoveRecentDocument(recent))
+        }
+    }
+
+    /// Resolved to documents before anything is removed, so the offsets handed over
+    /// are not invalidated partway through.
+    private func remove(at offsets: IndexSet) {
+        for recent in offsets.map({ model.recentDocuments[$0] }) {
+            model.removeRecentDocument(recent)
         }
     }
 }
@@ -392,7 +458,7 @@ private struct OSCSettingsForm: View {
                 }
             }
 
-            Section("Commands") {
+            Section {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("/viewtiful/next")
                     Text("/viewtiful/previous")
@@ -402,6 +468,10 @@ private struct OSCSettingsForm: View {
                 }
                 .fontDesign(.monospaced)
                 .textSelection(.enabled)
+            } header: {
+                Text("Commands")
+            } footer: {
+                Text("Page numbers are the ones Viewtiful displays, so a document's page offset applies to them.")
             }
         }
     }

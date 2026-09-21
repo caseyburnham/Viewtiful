@@ -18,6 +18,7 @@ struct ContentView: View {
     @State private var isShowingSettings = false
     @State private var isShowingMonitor = false
     @State private var isShowingPageEntry = false
+    @State private var isShowingPageNumbering = false
     @State private var controlsVisible = false
     @State private var isToolbarHovering = false
     @State private var controlsAutoHideTask: Task<Void, Never>?
@@ -37,6 +38,9 @@ struct ContentView: View {
         }
         .sheet(isPresented: $isShowingMonitor) {
             MonitorView(midiController: midiController, oscController: oscController)
+        }
+        .sheet(isPresented: $isShowingPageNumbering) {
+            PageOffsetSheet(model: model)
         }
         .fileImporter(isPresented: $isChoosingDocument, allowedContentTypes: [.pdf]) { result in
             switch result {
@@ -79,6 +83,11 @@ struct ContentView: View {
         }
         .onChange(of: isShowingPageEntry) {
             if !isShowingPageEntry, controlsVisible {
+                recordControlsInteraction()
+            }
+        }
+        .onChange(of: isShowingPageNumbering) {
+            if !isShowingPageNumbering, controlsVisible {
                 recordControlsInteraction()
             }
         }
@@ -156,12 +165,28 @@ struct ContentView: View {
     }
     #endif
 
+    /// A margin is the page's own paper carried past its edge, so it takes the page's
+    /// colors — white normally, black once inverted — rather than the window's.
+    private var usesPaperBackground: Bool {
+        model.pageMargin != .none
+    }
+
     private var viewerBackground: Color {
+        if model.invertPDFColors { return .black }
+        if usesPaperBackground { return .white }
         #if os(macOS)
-        Color(nsColor: model.invertPDFColors ? .black : .windowBackgroundColor)
+        return Color(nsColor: .windowBackgroundColor)
         #else
-        Color(uiColor: model.invertPDFColors ? .black : .systemBackground)
+        return Color(uiColor: .systemBackground)
         #endif
+    }
+
+    /// Taken from the shorter side so the border stays proportionate whichever way
+    /// the viewport is shaped.
+    private func marginInset(in size: CGSize) -> CGFloat {
+        let fraction = model.pageMargin.fraction
+        guard fraction > 0 else { return 0 }
+        return (min(size.width, size.height) * fraction).rounded()
     }
 
     private var viewer: some View {
@@ -171,10 +196,14 @@ struct ContentView: View {
                     viewerBackground
                     PDFPageView(document: document, pageIndex: model.currentPageIndex,
                                 invertColors: model.invertPDFColors, invertAnnotations: model.invertAnnotations,
-                                reduceMotion: reduceMotion,
+                                usesPaperBackground: usesPaperBackground,
                                 onPageTurn: turnPage,
                                 onGoToPage: showPageEntry)
-                        .accessibilityLabel("\(model.documentName), page \(model.displayedPageNumber) of \(model.pageCount)")
+                        .padding(marginInset(in: proxy.size))
+                        .accessibilityLabel("\(model.documentName), page \(model.displayedPageNumber) of \(model.lastPageNumber)")
+                        // The margin carries no view of its own, so the tap target has
+                        // to be declared for it or edge taps would stop at the page.
+                        .contentShape(Rectangle())
                         .simultaneousGesture(
                             SpatialTapGesture()
                                 .onEnded { value in
@@ -214,6 +243,7 @@ struct ContentView: View {
         .focusEffectDisabled()
         .onKeyPress(phases: .down) { key in
             guard !isShowingSettings, !isShowingMonitor, !isChoosingDocument, !isShowingPageEntry,
+                  !isShowingPageNumbering,
                   key.modifiers.intersection([.command, .control, .option]).isEmpty else { return .ignored }
             switch key.key {
             case .rightArrow: turnPage(.nextPage)
@@ -259,10 +289,10 @@ struct ContentView: View {
             } label: {
                 Label("Open", systemImage: "folder")
             }
+            .buttonBorderShape(.circle)
             .help("Open a show document")
             .fadesWithControls(controlsVisible, animation: controlsAnimation)
         }
-        .sharedBackgroundVisibility(.hidden)
         ToolbarSpacer(.fixed)
         ToolbarItem(placement: .primaryAction) {
             Menu {
@@ -275,20 +305,37 @@ struct ContentView: View {
                     }
                     .pickerStyle(.inline)
                 }
+                Section("Margin") {
+                    Picker("Margin", selection: $model.pageMargin) {
+                        ForEach(PageMargin.allCases) { margin in
+                            Text(margin.displayName).tag(margin)
+                        }
+                    }
+                    .pickerStyle(.inline)
+                }
+                Section {
+                    Button("Page Numbering…", systemImage: "number") {
+                        isShowingPageNumbering = true
+                    }
+                }
                 Button("Hide Controls", systemImage: "eye.slash", action: hideControls)
             } label: {
                 Label("Viewer Options", systemImage: "slider.horizontal.3")
             }
+            .buttonBorderShape(.circle)
             .disabled(!model.hasDocument)
-            .help("PDF appearance and viewer controls")
+            .help("PDF appearance, margin, and page numbering")
             .fadesWithControls(controlsVisible, animation: controlsAnimation)
         }
-        .sharedBackgroundVisibility(.hidden)
         ToolbarSpacer(.fixed)
-        ToolbarItemGroup(placement: .primaryAction) {
+        ToolbarItem(placement: .primaryAction) {
             Button("Monitors", systemImage: "waveform.path.ecg", action: showMonitors)
+                .buttonBorderShape(.circle)
                 .help("Open MIDI and OSC monitors (Command-Shift-M)")
                 .fadesWithControls(controlsVisible, animation: controlsAnimation)
+        }
+        ToolbarSpacer(.fixed)
+        ToolbarItem(placement: .primaryAction) {
             Button("Settings", systemImage: "gearshape") {
                 #if os(macOS)
                 openSettings()
@@ -296,10 +343,10 @@ struct ContentView: View {
                 isShowingSettings = true
                 #endif
             }
+            .buttonBorderShape(.circle)
             .help("Open Settings")
             .fadesWithControls(controlsVisible, animation: controlsAnimation)
         }
-        .sharedBackgroundVisibility(.hidden)
     }
 
     private var pageNavigationControls: some View {
@@ -307,45 +354,44 @@ struct ContentView: View {
             HStack(spacing: 12) {
                 Button("Previous Page", systemImage: "chevron.left") { turnPage(.previousPage) }
                     .labelStyle(.iconOnly)
+                    .buttonBorderShape(.circle)
                     .help("Previous page (Left Arrow)")
 
                 Button(action: showPageEntry) {
-                    Text("\(model.displayedPageNumber) of \(model.pageCount)")
+                    Text(pageReadout)
                         .monospacedDigit()
                         .frame(minWidth: 80)
                 }
+                .buttonBorderShape(.capsule)
                 .accessibilityLabel("Go to Page")
-                .accessibilityValue("\(model.displayedPageNumber) of \(model.pageCount)")
+                .accessibilityValue(pageReadout)
                 .help("Go to a page (⌘L)")
-                .popover(isPresented: $isShowingPageEntry) {
-                    Form {
-                        TextField("Page", text: $pageEntry)
-                            .focused($pageEntryFocused)
-                            #if !os(macOS)
-                            .keyboardType(.numberPad)
-                            #endif
-                            .onSubmit(jumpToPage)
-                        Text("Enter a page from 1 to \(model.pageCount).")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                        Button("Go to Page", action: jumpToPage)
-                            .disabled(!isValidPage)
-                            .keyboardShortcut(.defaultAction)
-                    }
-                    .padding()
-                    .frame(idealWidth: 280)
-                    .presentationCompactAdaptation(.popover)
-                    .onAppear { pageEntryFocused = true }
-                }
+                .modifier(PageEntryPresentation(
+                    isPresented: $isShowingPageEntry,
+                    pageEntry: $pageEntry,
+                    pageEntryFocused: $pageEntryFocused,
+                    prompt: pageEntryPrompt,
+                    isValidPage: isValidPage,
+                    jumpToPage: jumpToPage
+                ))
 
                 Button("Next Page", systemImage: "chevron.right") { turnPage(.nextPage) }
                     .labelStyle(.iconOnly)
+                    .buttonBorderShape(.circle)
                     .help("Next page (Right Arrow or Space)")
             }
             .buttonStyle(.glass)
-            .buttonBorderShape(.capsule)
             .controlSize(.large)
         }
+    }
+
+    private var pageReadout: String {
+        "\(model.displayedPageNumber) of \(model.lastPageNumber)"
+    }
+
+    private var pageEntryPrompt: String {
+        guard let range = model.labeledPageRange else { return "" }
+        return "Enter a page from \(range.lowerBound) to \(range.upperBound)."
     }
 
     private func presentRequestedSheet() {
@@ -416,7 +462,8 @@ struct ContentView: View {
 
     private func recordControlsInteraction() {
         controlsAutoHideTask?.cancel()
-        guard controlsVisible, model.hasDocument, !isShowingPageEntry, !isToolbarHovering else { return }
+        guard controlsVisible, model.hasDocument, !isShowingPageEntry, !isShowingPageNumbering,
+              !isToolbarHovering else { return }
 
         controlsAutoHideTask = Task { @MainActor in
             do {
@@ -425,14 +472,15 @@ struct ContentView: View {
                 return
             }
 
-            guard !Task.isCancelled, controlsVisible, !isShowingPageEntry, !isToolbarHovering else { return }
+            guard !Task.isCancelled, controlsVisible, !isShowingPageEntry, !isShowingPageNumbering,
+                  !isToolbarHovering else { return }
             hideControls()
         }
     }
 
     private var isValidPage: Bool {
-        guard let page = Int(pageEntry), model.pageCount > 0 else { return false }
-        return (1...model.pageCount).contains(page)
+        guard let page = Int(pageEntry), let range = model.labeledPageRange else { return false }
+        return range.contains(page)
     }
 
     private func showPageEntry() {
@@ -451,9 +499,9 @@ struct ContentView: View {
     }
 
     private func jumpToPage() {
-        guard let page = Int(pageEntry), model.pageCount > 0,
-              (1...model.pageCount).contains(page) else { return }
-        model.perform(.goToPage(page))
+        guard let page = Int(pageEntry), let range = model.labeledPageRange,
+              range.contains(page) else { return }
+        model.perform(.goToLabeledPage(page))
         isShowingPageEntry = false
     }
 
@@ -621,6 +669,52 @@ private final class DocumentHostingController<Content: View>: UIHostingControlle
     }
 }
 #endif
+
+/// Page entry, presented the way each platform can actually complete it. A popover
+/// works on the Mac, where the pointer and the keyboard are both free. On iPad the
+/// controls sit along the bottom edge, so a popover anchored to them ends up beneath
+/// the keyboard with its Go button out of reach; an alert floats clear of the keyboard
+/// and keeps both buttons visible, which also gives the number pad — a pad with no
+/// return key — somewhere to submit.
+private struct PageEntryPresentation: ViewModifier {
+    @Binding var isPresented: Bool
+    @Binding var pageEntry: String
+    @FocusState.Binding var pageEntryFocused: Bool
+    let prompt: String
+    let isValidPage: Bool
+    let jumpToPage: () -> Void
+
+    func body(content: Content) -> some View {
+        #if os(macOS)
+        content.popover(isPresented: $isPresented) {
+            Form {
+                TextField("Page", text: $pageEntry)
+                    .focused($pageEntryFocused)
+                    .onSubmit(jumpToPage)
+                Text(prompt)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Button("Go to Page", action: jumpToPage)
+                    .disabled(!isValidPage)
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding()
+            .frame(idealWidth: 280)
+            .onAppear { pageEntryFocused = true }
+        }
+        #else
+        content.alert("Go to Page", isPresented: $isPresented) {
+            TextField("Page", text: $pageEntry)
+                .keyboardType(.numberPad)
+            Button("Go", action: jumpToPage)
+                .disabled(!isValidPage)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(prompt)
+        }
+        #endif
+    }
+}
 
 private extension View {
     /// The bar's own alpha only reaches what the system draws inside it — its

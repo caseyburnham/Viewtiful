@@ -5,7 +5,11 @@ import PDFKit
 enum ViewtifulAction: Sendable {
     case nextPage
     case previousPage
+    /// A page counted from the front of the PDF, where the first page is 1.
     case goToPage(Int)
+    /// A page as the script numbers it, which the document's page offset shifts
+    /// away from the PDF's own ordering.
+    case goToLabeledPage(Int)
     case firstPage
     case lastPage
 }
@@ -26,6 +30,38 @@ enum PDFColorAppearance: String, CaseIterable, Identifiable, Sendable {
     var id: Self { self }
 }
 
+/// How much of the viewport is left clear around the page. The border is the page's
+/// own paper carried past its edge, so it follows the page's colors rather than the
+/// window's: white normally, black once pages are inverted.
+enum PageMargin: String, CaseIterable, Identifiable, Sendable {
+    case none
+    case small
+    case medium
+    case large
+
+    var id: Self { self }
+
+    var displayName: String {
+        switch self {
+        case .none: "None"
+        case .small: "Small"
+        case .medium: "Medium"
+        case .large: "Large"
+        }
+    }
+
+    /// A fraction of the viewport's shorter side, so the border stays proportionate
+    /// on a phone, an iPad, and a full-screen Mac alike.
+    var fraction: Double {
+        switch self {
+        case .none: 0
+        case .small: 0.02
+        case .medium: 0.045
+        case .large: 0.08
+        }
+    }
+}
+
 enum ViewerPresentationRequest: Equatable {
     case openDocument
 }
@@ -40,6 +76,34 @@ struct RecentDocument: Codable, Identifiable, Equatable, Sendable {
     var pageCount: Int
     var lastPageIndex: Int
     var lastOpened: Date
+    /// How far the script's own page numbering runs ahead of the PDF's: the number
+    /// on the first page of the PDF, less one. This belongs to the file rather than
+    /// to how it is being read, so it is remembered per document like the page.
+    var pageOffset: Int
+
+    init(id: String, displayName: String, bookmark: Data, pageCount: Int,
+         lastPageIndex: Int, lastOpened: Date, pageOffset: Int = 0) {
+        self.id = id
+        self.displayName = displayName
+        self.bookmark = bookmark
+        self.pageCount = pageCount
+        self.lastPageIndex = lastPageIndex
+        self.lastOpened = lastOpened
+        self.pageOffset = pageOffset
+    }
+
+    /// Decoded by hand so recents written before page offsets existed still load;
+    /// a list that fails to decode is discarded wholesale by the model.
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        displayName = try container.decode(String.self, forKey: .displayName)
+        bookmark = try container.decode(Data.self, forKey: .bookmark)
+        pageCount = try container.decode(Int.self, forKey: .pageCount)
+        lastPageIndex = try container.decode(Int.self, forKey: .lastPageIndex)
+        lastOpened = try container.decode(Date.self, forKey: .lastOpened)
+        pageOffset = try container.decodeIfPresent(Int.self, forKey: .pageOffset) ?? 0
+    }
 }
 
 @MainActor
@@ -102,12 +166,44 @@ final class ViewerModel {
         didSet { defaults.set(edgeTapNavigationEnabled, forKey: Keys.edgeTapNavigationEnabled) }
     }
 
+    var pageMargin: PageMargin {
+        didSet { defaults.set(pageMargin.rawValue, forKey: Keys.pageMargin) }
+    }
+
     var pageCount: Int {
         document?.pageCount ?? 0
     }
 
+    /// The offset for the document on screen. Reading it with nothing open, or
+    /// writing it to an unchanged value, leaves the stored recents alone.
+    var pageOffset: Int {
+        get { activeDocument?.pageOffset ?? 0 }
+        set {
+            guard let activeDocumentID,
+                  let index = recentDocuments.firstIndex(where: { $0.id == activeDocumentID }),
+                  recentDocuments[index].pageOffset != newValue else { return }
+            recentDocuments[index].pageOffset = newValue
+            saveRecentDocuments()
+        }
+    }
+
+    /// The range the script numbers its pages over, which is what the page readout
+    /// shows and what the page field accepts.
+    var labeledPageRange: ClosedRange<Int>? {
+        guard pageCount > 0 else { return nil }
+        return (1 + pageOffset)...(pageCount + pageOffset)
+    }
+
     var displayedPageNumber: Int {
-        pageCount == 0 ? 0 : currentPageIndex + 1
+        pageCount == 0 ? 0 : currentPageIndex + 1 + pageOffset
+    }
+
+    var firstPageNumber: Int {
+        1 + pageOffset
+    }
+
+    var lastPageNumber: Int {
+        pageCount == 0 ? 0 : pageCount + pageOffset
     }
 
     var hasDocument: Bool {
@@ -157,6 +253,7 @@ final class ViewerModel {
         } else {
             edgeTapNavigationEnabled = defaults.bool(forKey: Keys.edgeTapNavigationEnabled)
         }
+        pageMargin = PageMargin(rawValue: defaults.string(forKey: Keys.pageMargin) ?? "") ?? .none
 
         loadRecentDocuments()
     }
@@ -187,6 +284,10 @@ final class ViewerModel {
         case .goToPage(let pageNumber):
             guard (1...pageCount).contains(pageNumber) else { return }
             currentPageIndex = pageNumber - 1
+        case .goToLabeledPage(let pageNumber):
+            let index = pageNumber - 1 - pageOffset
+            guard (0..<pageCount).contains(index) else { return }
+            currentPageIndex = index
         case .firstPage:
             currentPageIndex = 0
         case .lastPage:
@@ -270,6 +371,17 @@ final class ViewerModel {
     func clearRecentDocuments() {
         recentDocuments.removeAll { $0.id != activeDocumentID }
         saveRecentDocuments()
+    }
+
+    /// Forgets a single remembered document. The open one stays: its page position
+    /// and offset are written back to its entry for as long as it is on screen.
+    func removeRecentDocument(_ recent: RecentDocument) {
+        guard recent.id != activeDocumentID else { return }
+        forgetRecentDocument(recent)
+    }
+
+    func canRemoveRecentDocument(_ recent: RecentDocument) -> Bool {
+        recent.id != activeDocumentID
     }
 
     func reportOpenError(_ error: Error) {
@@ -390,6 +502,7 @@ final class ViewerModel {
         static let startupBehavior = "startupBehavior"
         static let keepScreenAwake = "keepScreenAwake"
         static let edgeTapNavigationEnabled = "edgeTapNavigationEnabled"
+        static let pageMargin = "pageMargin"
         static let pdfColorAppearance = "pdfColorAppearance"
         static let legacyInvertPDFColors = "invertPDFColors"
     }

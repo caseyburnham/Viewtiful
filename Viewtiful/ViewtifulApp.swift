@@ -1,8 +1,25 @@
 import SwiftUI
+#if os(macOS)
+import AppKit
+
+/// Viewtiful's Mac scenes are single explicitly-opened windows rather than a document
+/// group, so closing the viewer leaves nothing to return to and no reason to keep the
+/// app running. Settings and Monitors are windows in their own right, so the app still
+/// stays up while either of those is open.
+@MainActor
+private final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
+    }
+}
+#endif
 
 @main
 @MainActor
 struct ViewtifulApp: App {
+    #if os(macOS)
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    #endif
     @Environment(\.openWindow) private var openWindow
     @State private var model = ViewerModel()
     @State private var oscController = OSCClient()

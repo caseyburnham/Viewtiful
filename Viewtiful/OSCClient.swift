@@ -53,7 +53,9 @@ struct OSCMessage: Equatable, Sendable {
                       page > 0 else {
                     return nil
                 }
-                return .goToPage(page)
+                // A console cues the page number printed on the script, which is
+                // what the viewer's own readout shows.
+                return .goToLabeledPage(page)
             }
 
             switch address {
@@ -75,7 +77,7 @@ struct OSCMessage: Equatable, Sendable {
            arguments.count == 1,
            case .integer(let page) = arguments[0],
            page > 0 {
-            return .goToPage(Int(page))
+            return .goToLabeledPage(Int(page))
         }
 
         return nil

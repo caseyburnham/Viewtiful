@@ -1,48 +1,193 @@
 import PDFKit
 
-/// Keeps a display-only vector rendering of the current page. Never modifies the library PDF.
+/// Keeps a display-only vector rendering of the current page, and prepares the pages
+/// on either side of it before they are asked for. Never modifies the library PDF.
+@MainActor
 final class PDFDisplayCache {
+    /// A document, and the page within it the view should be showing.
+    struct DisplayTarget {
+        let document: PDFDocument
+        let pageIndex: Int
+    }
+
+    /// How far either side of the current page to prepare. A script is read a page at
+    /// a time in both directions, so one each way covers nearly every turn.
+    private static let prefetchRadius = 1
+    /// Generous because prefetching fills this faster than navigation alone did, and
+    /// dropping a page renumbers the document the view is currently displaying.
+    private static let maxRenderedPages = 64
+    /// Large enough that PDFKit parses the page's content stream and fonts for real,
+    /// which is the slow half of drawing it, without paying for a full rasterization.
+    private static let warmupSize = CGSize(width: 512, height: 512)
+
+    /// PDFKit renders its own page tiles off the main thread while a document is on
+    /// screen, so reading a page from this queue is an access it already makes itself.
+    /// Serial, so a run of quick page turns queues its work rather than piling it up.
+    private static let renderQueue = DispatchQueue(
+        label: "Viewtiful.PDFDisplayCache.render",
+        qos: .userInitiated
+    )
+
+    /// Delivers a page that was not ready when the view asked for it. The view keeps
+    /// the page it already has until this lands, so a turn is never shown a blank.
+    var onPageReady: ((PDFDocument, Int) -> Void)?
+
     private(set) var source: PDFDocument?
     private var inverted = false
     private var invertAnnotations = false
     private var rendered: PDFDocument?
     private var renderedPageIndices: [Int: Int] = [:]
     private var pageAccessOrder: [Int] = []
-    private let maxRenderedPages = 16
+    private var pagesInFlight: Set<Int> = []
+    private var warmedPages: Set<Int> = []
+    /// The page the view last asked for. A render that finishes after the reader has
+    /// moved on is kept, but not shown: displaying it would turn the page backwards.
+    private var requestedPageIndex: Int?
+    /// Bumped whenever the document or the color treatment changes, so work that was
+    /// already in the air at that moment is discarded rather than applied.
+    private var generation = 0
 
-    func document(source: PDFDocument, pageIndex: Int, inverted: Bool, invertAnnotations: Bool) -> PDFDocument {
-        let configurationChanged = self.source !== source || self.inverted != inverted
+    /// The page to display right now, or `nil` if an inverted copy of it is still
+    /// being built. A `nil` answer is a request to leave the view alone and wait for
+    /// `onPageReady`, which is what keeps a turn from flashing through an empty view.
+    func target(source: PDFDocument, pageIndex: Int, inverted: Bool,
+                invertAnnotations: Bool) -> DisplayTarget? {
+        resetIfConfigurationChanged(source: source, inverted: inverted,
+                                    invertAnnotations: invertAnnotations)
+        requestedPageIndex = pageIndex
+        defer { prefetch(around: pageIndex) }
+
+        guard inverted else { return DisplayTarget(document: source, pageIndex: pageIndex) }
+
+        if let displayIndex = touch(pageIndex) {
+            return rendered.map { DisplayTarget(document: $0, pageIndex: displayIndex) }
+        }
+        // Nothing is on screen yet, so there is no outgoing page to hold. Build this
+        // one now rather than open the document to an empty window.
+        if renderedPageIndices.isEmpty,
+           let displayIndex = insert(renderedData(for: pageIndex), for: pageIndex) {
+            return rendered.map { DisplayTarget(document: $0, pageIndex: displayIndex) }
+        }
+        requestRender(of: pageIndex)
+        return nil
+    }
+
+    private func resetIfConfigurationChanged(source: PDFDocument, inverted: Bool,
+                                             invertAnnotations: Bool) {
+        let changed = self.source !== source || self.inverted != inverted
             || self.invertAnnotations != invertAnnotations
-        if configurationChanged {
+        if changed {
+            generation &+= 1
             rendered = nil
             renderedPageIndices.removeAll()
             pageAccessOrder.removeAll()
+            pagesInFlight.removeAll()
+            warmedPages.removeAll()
         }
         self.source = source
         self.inverted = inverted
         self.invertAnnotations = invertAnnotations
+        if inverted, rendered == nil { rendered = PDFDocument() }
+    }
 
-        guard inverted else { return source }
-        if rendered == nil { rendered = PDFDocument() }
-        guard let rendered else { return source }
-        if renderedPageIndices[pageIndex] == nil {
-            evictLeastRecentlyUsedPageIfNeeded(from: rendered)
-            guard let original = source.page(at: pageIndex),
-                  let pageDocument = Self.render(original, invertAnnotations: invertAnnotations),
-                  let page = pageDocument.page(at: 0) else { return source }
-            let displayIndex = rendered.pageCount
-            rendered.insert(page, at: displayIndex)
-            renderedPageIndices[pageIndex] = displayIndex
-            pageAccessOrder.append(pageIndex)
-        } else {
-            pageAccessOrder.removeAll { $0 == pageIndex }
-            pageAccessOrder.append(pageIndex)
+    /// Marks a rendered page as the most recently used and returns where it sits.
+    private func touch(_ pageIndex: Int) -> Int? {
+        guard let displayIndex = renderedPageIndices[pageIndex] else { return nil }
+        pageAccessOrder.removeAll { $0 == pageIndex }
+        pageAccessOrder.append(pageIndex)
+        return displayIndex
+    }
+
+    // MARK: - Preparing pages ahead of the turn
+
+    private func prefetch(around pageIndex: Int) {
+        guard let source, Self.prefetchRadius > 0 else { return }
+        for offset in 1...Self.prefetchRadius {
+            for neighbour in [pageIndex - offset, pageIndex + offset]
+            where (0..<source.pageCount).contains(neighbour) {
+                if inverted {
+                    requestRender(of: neighbour)
+                } else {
+                    warm(neighbour, in: source)
+                }
+            }
         }
-        return rendered.pageCount > 0 ? rendered : source
+    }
+
+    /// Draws a page PDFKit has not been asked for yet and throws the result away. The
+    /// image is not the point: parsing the page is, and that work is cached on the
+    /// page itself, so the view's first real draw of it no longer starts from cold.
+    private func warm(_ pageIndex: Int, in document: PDFDocument) {
+        guard !warmedPages.contains(pageIndex),
+              let page = document.page(at: pageIndex) else { return }
+        warmedPages.insert(pageIndex)
+        let carried = Unsafely(page)
+        Self.renderQueue.async {
+            _ = carried.value.thumbnail(of: Self.warmupSize, for: .cropBox)
+        }
+    }
+
+    private func requestRender(of pageIndex: Int) {
+        guard inverted, renderedPageIndices[pageIndex] == nil,
+              !pagesInFlight.contains(pageIndex),
+              let original = source?.page(at: pageIndex) else { return }
+        pagesInFlight.insert(pageIndex)
+
+        let page = Unsafely(original)
+        let invertAnnotations = self.invertAnnotations
+        let generation = self.generation
+        Self.renderQueue.async {
+            let data = Self.render(page.value, invertAnnotations: invertAnnotations)
+            Task { @MainActor [weak self] in
+                self?.finishRender(of: pageIndex, data: data, generation: generation)
+            }
+        }
+    }
+
+    private func finishRender(of pageIndex: Int, data: Data?, generation: Int) {
+        guard generation == self.generation else { return }
+        pagesInFlight.remove(pageIndex)
+        guard let displayIndex = insert(data, for: pageIndex), let rendered else { return }
+        // A page prepared ahead of time is kept but not shown, and one that finished
+        // after the reader moved past it would turn the page backwards.
+        guard pageIndex == requestedPageIndex else { return }
+        onPageReady?(rendered, displayIndex)
+    }
+
+    /// Renders a page on the calling thread. Used only for the first page of a
+    /// document, where there is nothing on screen to wait behind.
+    private func renderedData(for pageIndex: Int) -> Data? {
+        guard let original = source?.page(at: pageIndex) else { return nil }
+        return Self.render(original, invertAnnotations: invertAnnotations)
+    }
+
+    /// Adds a finished copy to the display document and returns where it landed.
+    private func insert(_ data: Data?, for pageIndex: Int) -> Int? {
+        guard let rendered else { return nil }
+        if let existing = renderedPageIndices[pageIndex] { return existing }
+
+        let page: PDFPage
+        if let data, let copy = PDFDocument(data: data), let rendering = copy.page(at: 0) {
+            page = rendering
+        } else if let fallback = source?.page(at: pageIndex)?.copy() as? PDFPage {
+            // A page that will not render inverted still has to appear, and it has to
+            // appear in this document: handing the view back the source document for
+            // one bad page would swap the whole show out and back on every turn.
+            page = fallback
+        } else {
+            return nil
+        }
+
+        evictLeastRecentlyUsedPageIfNeeded(from: rendered)
+        let displayIndex = rendered.pageCount
+        rendered.insert(page, at: displayIndex)
+        renderedPageIndices[pageIndex] = displayIndex
+        pageAccessOrder.append(pageIndex)
+        return displayIndex
     }
 
     private func evictLeastRecentlyUsedPageIfNeeded(from rendered: PDFDocument) {
-        guard rendered.pageCount >= maxRenderedPages,
+        guard rendered.pageCount >= Self.maxRenderedPages,
               let evictedPageIndex = pageAccessOrder.first,
               let evictedDisplayIndex = renderedPageIndices.removeValue(forKey: evictedPageIndex) else { return }
 
@@ -56,9 +201,7 @@ final class PDFDisplayCache {
         }
     }
 
-    func renderedPageIndex(for sourcePageIndex: Int) -> Int? {
-        renderedPageIndices[sourcePageIndex]
-    }
+    // MARK: - Drawing an inverted copy
 
     private static func drawAnnotations(_ annotations: [PDFAnnotation], in context: CGContext) {
         for annotation in annotations where annotation.shouldDisplay {
@@ -103,7 +246,9 @@ final class PDFDisplayCache {
         }
     }
 
-    static func render(_ original: PDFPage, invertAnnotations: Bool) -> PDFDocument? {
+    /// Returns a one-page PDF of the inverted page. The result is data rather than a
+    /// document so it can cross back from the render queue as a value.
+    static func render(_ original: PDFPage, invertAnnotations: Bool) -> Data? {
         guard let data = original.dataRepresentation,
               let copy = PDFDocument(data: data), let page = copy.page(at: 0) else { return nil }
         let annotations = page.annotations
@@ -142,6 +287,17 @@ final class PDFDisplayCache {
         }
         context.endPDFPage()
         context.closePDF()
-        return PDFDocument(data: outputData as Data)
+        return outputData as Data
+    }
+}
+
+/// PDFKit's types carry no `Sendable` conformance, but PDFKit itself draws pages off
+/// the main thread while a document is on screen. This carries one to the render
+/// queue, where it is only ever read, and only from that one queue at a time.
+private struct Unsafely<Value>: @unchecked Sendable {
+    let value: Value
+
+    init(_ value: Value) {
+        self.value = value
     }
 }
