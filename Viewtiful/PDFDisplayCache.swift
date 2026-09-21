@@ -138,7 +138,7 @@ final class PDFDisplayCache {
         let generation = self.generation
         Self.renderQueue.async {
             let data = Self.render(page.value, invertAnnotations: invertAnnotations)
-            Task { @MainActor [weak self] in
+            Task { @MainActor [weak self = self] in
                 self?.finishRender(of: pageIndex, data: data, generation: generation)
             }
         }
