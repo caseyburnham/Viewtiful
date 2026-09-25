@@ -1,15 +1,69 @@
 import SwiftUI
 #if os(macOS)
 import AppKit
+import UniformTypeIdentifiers
 
-/// Viewtiful's Mac scenes are single explicitly-opened windows rather than a document
-/// group, so closing the viewer leaves nothing to return to and no reason to keep the
-/// app running. Settings and the Activity Log are windows in their own right, so the
-/// app still stays up while either of those is open.
+/// Launches the way Preview does: with no viewer on screen, Viewtiful offers the
+/// standalone Open panel instead of an empty window, and the viewer only appears
+/// once a show has been chosen. Cancelling leaves the app running with no windows,
+/// and clicking it in the Dock offers the panel again.
 @MainActor
-private final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Loads the chosen PDF and brings up the viewer. Set by the app's scene body,
+    /// the only place the model and the `openWindow` action are both at hand.
+    var openDocument: ((URL) -> Void)?
+    private var openPanel: NSOpenPanel?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // A PDF opened from the Finder arrives as part of launching, and SwiftUI puts
+        // up its window in response. Waiting a turn lets that window appear first, so
+        // the panel only shows when Viewtiful was launched with nothing to open.
+        DispatchQueue.main.async { [self] in
+            if !hasVisibleWindows {
+                presentOpenPanel()
+            }
+        }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard !flag else { return true }
+        presentOpenPanel()
+        return false
+    }
+
+    /// Cancelling the panel or closing the viewer leaves Viewtiful ready to open the
+    /// next show, as Preview does, rather than quitting out from under the person.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        false
+    }
+
+    /// Shows the standalone Open panel, or brings it forward if it is already up.
+    func presentOpenPanel() {
+        if let openPanel {
+            openPanel.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.pdf]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        openPanel = panel
+        NSApp.activate()
+
+        panel.begin { [weak self] response in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.openPanel = nil
+                if response == .OK, let url = panel.url {
+                    self.openDocument?(url)
+                }
+            }
+        }
+    }
+
+    private var hasVisibleWindows: Bool {
+        NSApp.windows.contains { $0.isVisible && $0.canBecomeMain }
     }
 }
 #endif
@@ -37,6 +91,8 @@ struct ViewtifulApp: App {
 
     var body: some Scene {
         #if os(macOS)
+        let _ = connectOpenPanel()
+
         Window("Viewtiful", id: "viewer") {
             ContentView(model: model, oscController: oscController, midiController: midiController,
                         activityLog: activityLog)
@@ -45,9 +101,13 @@ struct ViewtifulApp: App {
         .defaultSize(width: 960, height: 720)
         .windowResizability(.contentMinSize)
         .windowToolbarStyle(.unified)
+        // The launch Open panel stands in for the empty viewer, and a restored viewer
+        // would come back without its show, so the viewer only opens once one is chosen.
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
         .commands {
             ViewerCommands(
-                requestPresentation: { model.requestPresentation($0) },
+                presentOpenPanel: { appDelegate.presentOpenPanel() },
                 openViewer: { openWindow(id: "viewer") }
             )
         }
@@ -74,4 +134,15 @@ struct ViewtifulApp: App {
         .windowResizability(.contentMinSize)
         #endif
     }
+
+    #if os(macOS)
+    /// Hands the delegate what a pick from the standalone Open panel needs: the
+    /// show loaded into the model, and the viewer window brought up to display it.
+    private func connectOpenPanel() {
+        appDelegate.openDocument = { [model, openWindow] url in
+            model.openDocument(at: url)
+            openWindow(id: "viewer")
+        }
+    }
+    #endif
 }

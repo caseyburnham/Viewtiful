@@ -81,7 +81,11 @@ struct ContentView: View {
             toggleControls: toggleControls,
             perform: model.perform
         ))
+        #if !os(macOS)
+        // The viewer's appearance is overridden below this view, not at it, so the
+        // environment here still reports the system's own scheme.
         .onChange(of: colorScheme, initial: true) { model.systemIsDark = colorScheme == .dark }
+        #endif
         .onChange(of: scenePhase, initial: true) { updateLifecycle() }
         .onChange(of: model.keepScreenAwake) { updateLifecycle() }
         .onChange(of: model.presentationRequest, initial: true) { presentRequestedSheet() }
@@ -119,6 +123,12 @@ struct ContentView: View {
                 .toolbar { viewerToolbar }
                 .scrollEdgeEffectStyle(.soft, for: .top)
         }
+        // The window's appearance only reaches what AppKit draws, like the title.
+        // SwiftUI's glass and the toolbar items declared in here keep resolving
+        // against their own scheme, so they are given the page's too.
+        .transformEnvironment(\.colorScheme) { scheme in
+            if let chromeIsDark { scheme = chromeIsDark ? .dark : .light }
+        }
         // The stack defines its own safe area region, so the document ignoring the
         // titlebar inset inside it only reaches the top of the window if the stack
         // gives up that inset too.
@@ -126,7 +136,8 @@ struct ContentView: View {
         .toolbarVisibility(controlsVisible ? .visible : .hidden, for: .windowToolbar)
         .toolbarBackgroundVisibility(controlsVisible ? .automatic : .hidden, for: .windowToolbar)
         .background {
-            TitlebarConfigurator()
+            TitlebarConfigurator(isDark: chromeIsDark)
+            SystemAppearanceMonitor { model.systemIsDark = $0 }
             FullScreenPointerHiding(isEnabled: model.hasDocument)
             ToolbarHoverMonitor { isHovering in
                 isToolbarHovering = isHovering
@@ -148,7 +159,7 @@ struct ContentView: View {
 
     #if !os(macOS)
     private var documentNavigation: some View {
-        DocumentNavigation(controlsVisible: controlsVisible, reduceMotion: reduceMotion) {
+        DocumentNavigation(controlsVisible: controlsVisible, reduceMotion: reduceMotion, isDark: chromeIsDark) {
             viewer
                 .navigationTitle(model.hasDocument ? model.documentName : "Viewtiful")
                 .toolbar { viewerToolbar }
@@ -174,6 +185,13 @@ struct ContentView: View {
         .documentLaunchSubtitle("Open a PDF script to follow during the show.")
     }
     #endif
+
+    /// While a page is on screen the toolbar and controls sit over it, so they take the
+    /// page's appearance rather than the system's and stay legible against it. With no
+    /// document, `nil` leaves the window following the system like any other.
+    private var chromeIsDark: Bool? {
+        model.hasDocument ? model.invertPDFColors : nil
+    }
 
     /// A margin is the page's own paper carried past its edge, so it takes the page's
     /// colors — white normally, black once inverted — rather than the window's.
@@ -332,6 +350,14 @@ struct ContentView: View {
         }
         ToolbarSpacer(.fixed)
         ToolbarItem(placement: .primaryAction) {
+            Button("Activity Log", systemImage: "waveform.path.ecg", action: showActivityLog)
+                .buttonBorderShape(.circle)
+                .help("Open the MIDI and OSC activity log (⇧⌘L)")
+                .fadesWithControls(controlsVisible, animation: controlsAnimation)
+        }
+        ToolbarSpacer(.fixed)
+        // Viewer Options and Settings share a group: both are where the viewer is set up.
+        ToolbarItem(placement: .primaryAction) {
             Menu {
                 Section("PDF Appearance") {
                     Picker("Colors", selection: $model.pdfColorAppearance) {
@@ -342,14 +368,14 @@ struct ContentView: View {
                     }
                     .pickerStyle(.inline)
                 }
-                Section("Margin") {
-                    Picker("Margin", selection: $model.pageMargin) {
-                        ForEach(PageMargin.allCases) { margin in
-                            Text(margin.displayName).tag(margin)
-                        }
+                // An inline picker heads its own section with its label, so it isn't
+                // wrapped in another one.
+                Picker("Margin", selection: $model.pageMargin) {
+                    ForEach(PageMargin.allCases) { margin in
+                        Text(margin.displayName).tag(margin)
                     }
-                    .pickerStyle(.inline)
                 }
+                .pickerStyle(.inline)
                 Section {
                     Button("Page Numbering…", systemImage: "number") {
                         isShowingPageNumbering = true
@@ -364,14 +390,6 @@ struct ContentView: View {
             .help("PDF appearance, margin, and page numbering")
             .fadesWithControls(controlsVisible, animation: controlsAnimation)
         }
-        ToolbarSpacer(.fixed)
-        ToolbarItem(placement: .primaryAction) {
-            Button("Activity Log", systemImage: "waveform.path.ecg", action: showActivityLog)
-                .buttonBorderShape(.circle)
-                .help("Open the MIDI and OSC activity log (⇧⌘M)")
-                .fadesWithControls(controlsVisible, animation: controlsAnimation)
-        }
-        ToolbarSpacer(.fixed)
         ToolbarItem(placement: .primaryAction) {
             Button("Settings", systemImage: "gearshape") {
                 #if os(macOS)
@@ -659,15 +677,56 @@ private struct ToolbarHoverMonitor: NSViewRepresentable {
     }
 }
 
-/// Keeps the document beneath the native window toolbar.
+/// Reports the system's own light or dark appearance. The viewer window's appearance
+/// is pinned to the page's, which the SwiftUI environment inside it then reflects, so
+/// the system's is read from the app instead, which the window's pinning never reaches.
+private struct SystemAppearanceMonitor: NSViewRepresentable {
+    let onChange: (Bool) -> Void
+
+    func makeNSView(context: Context) -> MonitoringView {
+        MonitoringView(onChange: onChange)
+    }
+
+    func updateNSView(_ view: MonitoringView, context: Context) {
+        view.onChange = onChange
+    }
+
+    final class MonitoringView: NSView {
+        var onChange: (Bool) -> Void
+        private var observation: NSKeyValueObservation?
+
+        init(onChange: @escaping (Bool) -> Void) {
+            self.onChange = onChange
+            super.init(frame: .zero)
+            observation = NSApp.observe(\.effectiveAppearance, options: [.initial, .new]) { [weak self] app, _ in
+                MainActor.assumeIsolated {
+                    let isDark = app.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                    self?.onChange(isDark)
+                }
+            }
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { fatalError("SystemAppearanceMonitor is not loaded from a nib") }
+    }
+}
+
+/// Keeps the document beneath the native window toolbar, and gives the window the
+/// page's appearance so the toolbar's glyphs read against the page behind them.
 private struct TitlebarConfigurator: NSViewRepresentable {
+    /// `nil` leaves the window following the system.
+    let isDark: Bool?
+
     func makeNSView(context: Context) -> ReportingView { ReportingView() }
 
     func updateNSView(_ view: ReportingView, context: Context) {
+        view.isDark = isDark
         view.configureWindow()
     }
 
     final class ReportingView: NSView {
+        var isDark: Bool?
+
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             configureWindow()
@@ -679,6 +738,10 @@ private struct TitlebarConfigurator: NSViewRepresentable {
             guard let window else { return }
             if !window.styleMask.contains(.fullSizeContentView) {
                 window.styleMask.insert(.fullSizeContentView)
+            }
+            let appearance = isDark.flatMap { NSAppearance(named: $0 ? .darkAqua : .aqua) }
+            if window.appearance?.name != appearance?.name {
+                window.appearance = appearance
             }
         }
 
@@ -692,20 +755,32 @@ private struct TitlebarConfigurator: NSViewRepresentable {
 private struct DocumentNavigation<Content: View>: UIViewControllerRepresentable {
     let controlsVisible: Bool
     let reduceMotion: Bool
+    /// The page's appearance, which the bar and controls take so they read against it.
+    /// Overriding it here rather than on the window keeps the system's own scheme
+    /// visible to the views above, which is what Match System resolves against.
+    let isDark: Bool?
     @ViewBuilder let content: () -> Content
 
     func makeUIViewController(context: Context) -> UINavigationController {
         let host = DocumentHostingController(rootView: content())
         let navigation = UINavigationController(rootViewController: host)
         navigation.loadViewIfNeeded()
+        navigation.overrideUserInterfaceStyle = interfaceStyle
         host.setControlsVisible(controlsVisible, animated: false)
         return navigation
     }
 
     func updateUIViewController(_ navigation: UINavigationController, context: Context) {
+        if navigation.overrideUserInterfaceStyle != interfaceStyle {
+            navigation.overrideUserInterfaceStyle = interfaceStyle
+        }
         guard let host = navigation.viewControllers.first as? DocumentHostingController<Content> else { return }
         host.rootView = content()
         host.setControlsVisible(controlsVisible, animated: !reduceMotion && !context.transaction.disablesAnimations)
+    }
+
+    private var interfaceStyle: UIUserInterfaceStyle {
+        isDark.map { $0 ? .dark : .light } ?? .unspecified
     }
 }
 
@@ -883,14 +958,19 @@ extension FocusedValues {
 
 struct ViewerCommands: Commands {
     @FocusedValue(\.viewerCommands) private var viewer
-    let requestPresentation: (ViewerPresentationRequest) -> Void
+    let presentOpenPanel: () -> Void
     let openViewer: () -> Void
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
+            // With the viewer in front, the picker attaches to it as a sheet. Otherwise
+            // there is no window to attach to, so the standalone panel comes up instead.
             Button("Open Document…") {
-                requestPresentation(.openDocument)
-                openViewer()
+                if let viewer {
+                    viewer.openDocument()
+                } else {
+                    presentOpenPanel()
+                }
             }
             .keyboardShortcut("o")
 
@@ -915,8 +995,8 @@ struct ViewerCommands: Commands {
 
             Divider()
 
-            // ⌘W stays with the window, which quits Viewtiful. Closing the document
-            // instead returns to the launcher and keeps the app running.
+            // ⌘W stays with the window. Closing the document instead keeps the viewer
+            // up and returns it to the launcher.
             Button("Close Document") { viewer?.closeDocument() }
                 .keyboardShortcut("w", modifiers: [.command, .shift])
                 .disabled(viewer?.hasDocument != true)
@@ -938,7 +1018,7 @@ struct ViewerCommands: Commands {
                 .keyboardShortcut("t", modifiers: [.command, .option])
                 .disabled(viewer?.hasDocument != true)
             Button("Show Activity Log") { viewer?.showActivityLog() }
-                .keyboardShortcut("m", modifiers: [.command, .shift])
+                .keyboardShortcut("l", modifiers: [.command, .shift])
         }
     }
 }
