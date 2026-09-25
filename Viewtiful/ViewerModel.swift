@@ -118,7 +118,7 @@ final class ViewerModel {
     /// leave later pages unreadable mid-show.
     @ObservationIgnored private var accessedURL: URL?
 
-    private(set) var document: PDFDocument?
+    private(set) var document: ShowDocument?
     private(set) var activeDocumentID: RecentDocument.ID?
     private(set) var currentPageIndex = 0
     private(set) var recentDocuments: [RecentDocument] = []
@@ -170,6 +170,12 @@ final class ViewerModel {
         didSet { defaults.set(pageMargin.rawValue, forKey: Keys.pageMargin) }
     }
 
+    /// Whether Next on the last page returns to the first, and Previous on the first
+    /// goes to the last, so a show can be reset for the next performance by carrying on.
+    var wrapsAround: Bool {
+        didSet { defaults.set(wrapsAround, forKey: Keys.wrapsAround) }
+    }
+
     var pageCount: Int {
         document?.pageCount ?? 0
     }
@@ -198,8 +204,11 @@ final class ViewerModel {
         pageCount == 0 ? 0 : currentPageIndex + 1 + pageOffset
     }
 
+    /// The number printed on the PDF's first page. Editing it is how the page offset
+    /// is set, since that is the number a person can read off the script.
     var firstPageNumber: Int {
-        1 + pageOffset
+        get { 1 + pageOffset }
+        set { pageOffset = newValue - 1 }
     }
 
     var lastPageNumber: Int {
@@ -254,6 +263,7 @@ final class ViewerModel {
             edgeTapNavigationEnabled = defaults.bool(forKey: Keys.edgeTapNavigationEnabled)
         }
         pageMargin = PageMargin(rawValue: defaults.string(forKey: Keys.pageMargin) ?? "") ?? .none
+        wrapsAround = defaults.object(forKey: Keys.wrapsAround) as? Bool ?? true
 
         loadRecentDocuments()
     }
@@ -272,15 +282,30 @@ final class ViewerModel {
         return presentationRequest
     }
 
+    /// Whether a step in that direction lands on another page, which it always does
+    /// when wrapping around and never does from the end it would run off.
+    func canPerform(_ action: ViewtifulAction) -> Bool {
+        guard pageCount > 1 else { return false }
+        switch action {
+        case .nextPage: return wrapsAround || currentPageIndex < pageCount - 1
+        case .previousPage: return wrapsAround || currentPageIndex > 0
+        default: return true
+        }
+    }
+
     func perform(_ action: ViewtifulAction) {
         guard pageCount > 0 else { return }
         let previousPageIndex = currentPageIndex
 
         switch action {
         case .nextPage:
-            currentPageIndex = (currentPageIndex + 1) % pageCount
+            currentPageIndex = wrapsAround
+                ? (currentPageIndex + 1) % pageCount
+                : min(currentPageIndex + 1, pageCount - 1)
         case .previousPage:
-            currentPageIndex = (currentPageIndex - 1 + pageCount) % pageCount
+            currentPageIndex = wrapsAround
+                ? (currentPageIndex - 1 + pageCount) % pageCount
+                : max(currentPageIndex - 1, 0)
         case .goToPage(let pageNumber):
             guard (1...pageCount).contains(pageNumber) else { return }
             currentPageIndex = pageNumber - 1
@@ -310,7 +335,7 @@ final class ViewerModel {
         // files already inside the container, still read normally.
         let didStartAccessing = url.startAccessingSecurityScopedResource()
 
-        guard let loadedDocument = PDFDocument(url: url), !loadedDocument.isLocked, loadedDocument.pageCount > 0 else {
+        guard let loadedDocument = ShowDocument(url: url), !loadedDocument.isLocked, loadedDocument.pageCount > 0 else {
             if didStartAccessing {
                 url.stopAccessingSecurityScopedResource()
             }
@@ -401,7 +426,7 @@ final class ViewerModel {
         saveRecentDocuments()
     }
 
-    private func show(_ loadedDocument: PDFDocument, as record: RecentDocument, accessing url: URL?) {
+    private func show(_ loadedDocument: ShowDocument, as record: RecentDocument, accessing url: URL?) {
         relinquishAccess()
         accessedURL = url
         document = loadedDocument
@@ -504,6 +529,7 @@ final class ViewerModel {
         static let keepScreenAwake = "keepScreenAwake"
         static let edgeTapNavigationEnabled = "edgeTapNavigationEnabled"
         static let pageMargin = "pageMargin"
+        static let wrapsAround = "wrapsAround"
         static let pdfColorAppearance = "pdfColorAppearance"
         static let legacyInvertPDFColors = "invertPDFColors"
     }

@@ -22,12 +22,13 @@ private struct MIDITriggerEditor: View {
                         Text(kind.displayName).tag(kind)
                     }
                 }
-                valueField("Channel (1–16)", field: .channel)
-                valueField("Byte 1 (0–127)", field: .byte1)
-                if binding.kind != .programChange {
-                    valueField("Byte 2 (0–127)", field: .byte2)
+                valueField("Channel", field: .channel)
+                valueField(binding.kind.byte1Title, field: .byte1,
+                           noteName: binding.kind == .note ? MIDINoteName.name(for: binding.byte1) : nil)
+                if binding.kind.matchesValue, let byte2Title = binding.kind.byte2Title {
+                    valueField(byte2Title, field: .byte2)
                     if binding.matchesAnyByte2 {
-                        Text("Any positive Byte 2 value matches. Edit Byte 2 to use an exact value.")
+                        Text("Matches any \(byte2Title.lowercased()) above 0. Enter a value to match it exactly.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                     }
@@ -40,10 +41,13 @@ private struct MIDITriggerEditor: View {
                         Text(kind.displayName).tag(kind as MIDITrigger.Kind?)
                     }
                 }
-                draftField("Channel (1–16)", value: $draftChannel)
-                draftField("Byte 1 (0–127)", value: $draftByte1)
-                if draftKind != .programChange {
-                    draftField("Byte 2 (0–127)", value: $draftByte2)
+                if let draftKind {
+                    draftField("Channel", field: .channel, value: $draftChannel)
+                    draftField(draftKind.byte1Title, field: .byte1, value: $draftByte1,
+                               noteName: draftKind == .note ? draftNoteName : nil)
+                    if draftKind.matchesValue, let byte2Title = draftKind.byte2Title {
+                        draftField(byte2Title, field: .byte2, value: $draftByte2)
+                    }
                 }
                 Button("Save Mapping", action: saveDraft)
                     .disabled(!draftIsValid)
@@ -78,45 +82,81 @@ private struct MIDITriggerEditor: View {
 
     private var bindingSummary: String {
         guard let binding else { return "Not assigned" }
-        return "\(binding.kind.displayName) · Channel \(Int(binding.channel) + 1) · \(binding.byte1)"
+        return "\(binding.kind.displayName) · Channel \(Int(binding.channel) + 1) · "
+            + "\(binding.kind.byte1Title) \(binding.kind.describeByte1(binding.byte1))"
     }
 
-    private func valueField(_ title: String, field: MIDITriggerField) -> some View {
-        LabeledContent(title) {
-            TextField(title, value: Binding(
-                get: { controller.bindingFieldValue(action, field: field) ?? 0 },
-                set: { controller.setBindingField(action, field: field, value: $0) }
-            ), format: .number.grouping(.never))
-                .labelsHidden()
-                .textFieldStyle(.roundedBorder)
-                .multilineTextAlignment(.trailing)
-                .frame(width: 72)
-                .accessibilityLabel("\(action.title), \(title)")
-                #if !os(macOS)
-                .keyboardType(.numberPad)
-                #endif
+    private var draftNoteName: String? {
+        guard let note = UInt8(draftByte1), note <= 127 else { return nil }
+        return MIDINoteName.name(for: note)
+    }
+
+    /// Channels count from 1 as controllers print them; data bytes from 0.
+    private static func range(of field: MIDITriggerField) -> ClosedRange<Int> {
+        field == .channel ? 1...16 : 0...127
+    }
+
+    private func valueField(_ title: String, field: MIDITriggerField, noteName: String? = nil) -> some View {
+        LabeledContent {
+            HStack {
+                if let noteName {
+                    Text(noteName)
+                        .foregroundStyle(.secondary)
+                }
+                TextField(title, value: Binding(
+                    get: { controller.bindingFieldValue(action, field: field) ?? 0 },
+                    set: { controller.setBindingField(action, field: field, value: $0) }
+                ), format: .number.grouping(.never))
+                    .labelsHidden()
+                    .textFieldStyle(.roundedBorder)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 72)
+                    .accessibilityLabel("\(action.title), \(title)")
+                    #if !os(macOS)
+                    .keyboardType(.numberPad)
+                    #endif
+            }
+        } label: {
+            fieldLabel(title, field: field)
         }
     }
 
-    private func draftField(_ title: String, value: Binding<String>) -> some View {
-        LabeledContent(title) {
-            TextField(title, text: value)
-                .labelsHidden()
-                .textFieldStyle(.roundedBorder)
-                .multilineTextAlignment(.trailing)
-                .frame(width: 72)
-                .accessibilityLabel("\(action.title), \(title)")
-                #if !os(macOS)
-                .keyboardType(.numberPad)
-                #endif
+    private func draftField(_ title: String, field: MIDITriggerField, value: Binding<String>,
+                            noteName: String? = nil) -> some View {
+        LabeledContent {
+            HStack {
+                if let noteName {
+                    Text(noteName)
+                        .foregroundStyle(.secondary)
+                }
+                TextField(title, text: value)
+                    .labelsHidden()
+                    .textFieldStyle(.roundedBorder)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 72)
+                    .accessibilityLabel("\(action.title), \(title)")
+                    #if !os(macOS)
+                    .keyboardType(.numberPad)
+                    #endif
+            }
+        } label: {
+            fieldLabel(title, field: field)
         }
+    }
+
+    /// Two texts rather than a stack, so the form styles the range as a subtitle.
+    @ViewBuilder
+    private func fieldLabel(_ title: String, field: MIDITriggerField) -> some View {
+        let range = Self.range(of: field)
+        Text(title)
+        Text("\(range.lowerBound)–\(range.upperBound)")
     }
 
     private var draftIsValid: Bool {
         guard let draftKind,
               let channel = Int(draftChannel), (1...16).contains(channel),
               let byte1 = Int(draftByte1), (0...127).contains(byte1) else { return false }
-        if draftKind != .programChange {
+        if draftKind.matchesValue {
             guard let byte2 = Int(draftByte2), (0...127).contains(byte2) else { return false }
         }
         return true
@@ -168,10 +208,6 @@ private struct MIDISettingsSection: View {
 
         } header: {
             Text("MIDI Input")
-        } footer: {
-            Text(controller.enabled
-                 ? "Supported MIDI messages from the selected source can trigger navigation."
-                 : "MIDI input is disabled until Enable MIDI is turned on.")
         }
 
         Section {
@@ -181,23 +217,15 @@ private struct MIDISettingsSection: View {
         } header: {
             Text("Page Navigation")
         } footer: {
-            Text("Capture a control from a connected MIDI device, or expand an action to enter its mapping manually. Capturing a control does not turn the page.")
+            Text("Capture a control from your device, or expand an action to enter it by hand.")
         }
 
         Section {
-            Toggle("Enable Program Change Recall", isOn: $controller.programChangeRecallEnabled)
-
-            if controller.programChangeRecallEnabled {
-                Stepper(
-                    "Page Offset: \(controller.programChangeOffset)",
-                    value: $controller.programChangeOffset,
-                    in: -127...128
-                )
-            }
+            Toggle("Recall Pages with Program Change", isOn: $controller.programChangeRecallEnabled)
         } header: {
-            Text("Program Change Page Recall")
+            Text("Program Change")
         } footer: {
-            Text("PDF page = Program + Offset. Program Change values are zero-based; use offset 1 for Program 0 → the first page of the PDF. This counts from the front of the PDF and ignores the document's page offset, so the two do not stack.")
+            Text("Program 0 recalls page 1, using the document’s page numbering.")
         }
 
     }
@@ -240,10 +268,10 @@ struct GeneralSettingsView: View {
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
-        }
-        .toolbar {
-            ToolbarItem(placement: .confirmationAction) {
-                Button("Done") { dismiss() }
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
             }
         }
         .onDisappear { midiController.cancelLearning() }
@@ -292,7 +320,7 @@ private struct GeneralSettingsForm: View {
             } header: {
                 Text("PDF Appearance")
             } footer: {
-                Text("Matching the system appearance inverts pages in Dark Mode. Annotation colors are preserved unless you invert them with the page; marks flattened into the page always invert. The original PDF is unchanged.")
+                Text("Match System inverts pages in Dark Mode. Annotations keep their colors unless inverted too.")
             }
 
             Section {
@@ -304,7 +332,7 @@ private struct GeneralSettingsForm: View {
             } header: {
                 Text("Margin")
             } footer: {
-                Text("Leaves a border around the page instead of filling the screen edge to edge. The border matches the page: white normally, black when pages are inverted.")
+                Text("A border around the page, in the page’s own color.")
             }
 
             Section {
@@ -312,15 +340,18 @@ private struct GeneralSettingsForm: View {
             } header: {
                 Text("During a Show")
             } footer: {
-                Text("Prevents sleep while a document is open. On iPad, Viewtiful must remain in the foreground.")
+                Text("Prevents sleep while a document is open. On iPad, Viewtiful must stay in the foreground.")
             }
 
             Section {
+                #if !os(macOS)
                 Toggle("Tap Screen Edges to Turn Pages", isOn: $model.edgeTapNavigationEnabled)
+                #endif
+                Toggle("Wrap Around at the End", isOn: $model.wrapsAround)
             } header: {
                 Text("Page Navigation")
             } footer: {
-                Text("Tap an edge to turn a page. Tap the center to show or hide controls. You can also swipe or use a keyboard, MIDI, or OSC.")
+                Text("Wrapping around turns from the last page back to the first, ready for the next show.")
             }
 
             RecentDocumentsSection(model: model)
@@ -349,7 +380,7 @@ private struct RecentDocumentsSection: View {
         } header: {
             Text("Recent Documents")
         } footer: {
-            Text("Viewtiful remembers where each document is, the page it was left on, and its page offset. Removing one forgets that, not the file itself. The open document is always kept.")
+            Text("Each document remembers its last page and page numbering. Removing one doesn’t delete the file.")
         }
     }
 
@@ -433,7 +464,7 @@ private struct OSCSettingsForm: View {
             } header: {
                 Text("Listener")
             } footer: {
-                Text("Send OSC over UDP to one of the addresses above on the selected port.")
+                Text("Send OSC over UDP to one of these addresses on this port.")
             }
 
             Section {
@@ -452,9 +483,9 @@ private struct OSCSettingsForm: View {
                 Text("Sender Restriction")
             } footer: {
                 if controller.senderRestrictionEnabled {
-                    Text("Only commands from this exact IP address are accepted. Leave it blank only while configuring; no sender is accepted until an address is entered.")
+                    Text("Only this IP address is accepted. Nothing is accepted while it’s blank.")
                 } else {
-                    Text("Viewtiful accepts OSC commands from any sender on the local network.")
+                    Text("Commands are accepted from any sender on the local network.")
                 }
             }
 
@@ -471,7 +502,7 @@ private struct OSCSettingsForm: View {
             } header: {
                 Text("Commands")
             } footer: {
-                Text("Page numbers are the ones Viewtiful displays, so a document's page offset applies to them.")
+                Text("Page numbers follow the document’s page numbering.")
             }
         }
     }

@@ -42,6 +42,34 @@ struct MIDITrigger: Codable, Equatable, Sendable {
             case .programChange: "Program Change"
             }
         }
+
+        /// Whether a mapping distinguishes messages by their second byte. Only a
+        /// Control Change does: one knob can send several meaningful values.
+        var matchesValue: Bool { self == .controlChange }
+
+        /// What the message's first data byte means for this kind of message.
+        var byte1Title: String {
+            switch self {
+            case .note: "Note"
+            case .controlChange: "Controller"
+            case .programChange: "Program"
+            }
+        }
+
+        /// What the second data byte means, or `nil` for Program Change, which has none.
+        var byte2Title: String? {
+            switch self {
+            case .note: "Velocity"
+            case .controlChange: "Value"
+            case .programChange: nil
+            }
+        }
+
+        /// The first data byte as a controller might label it. Notes carry their name
+        /// as well as their number, since controllers print one or the other.
+        func describeByte1(_ value: UInt8) -> String {
+            self == .note ? "\(value) (\(MIDINoteName.name(for: value)))" : "\(value)"
+        }
     }
 
     var kind: Kind
@@ -86,14 +114,14 @@ struct MIDITrigger: Codable, Equatable, Sendable {
 
     func matches(_ activity: MIDIActivity) -> Bool {
         guard kind == activity.kind, channel == activity.channel, byte1 == activity.byte1 else { return false }
-        // Program Change has no second data byte. Its stored byte 2 is a UI
-        // placeholder and must not prevent a manually edited binding firing.
-        return kind == .programChange || matchesAnyByte2 || byte2 == activity.byte2
+        // Only a Control Change is told apart by its value. A note turns the page on
+        // Note On however hard it is struck, and Program Change has no second byte.
+        return !kind.matchesValue || matchesAnyByte2 || byte2 == activity.byte2
     }
 
     func conflicts(with other: MIDITrigger) -> Bool {
         guard kind == other.kind, channel == other.channel, byte1 == other.byte1 else { return false }
-        return kind == .programChange || matchesAnyByte2 || other.matchesAnyByte2 || byte2 == other.byte2
+        return !kind.matchesValue || matchesAnyByte2 || other.matchesAnyByte2 || byte2 == other.byte2
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -146,13 +174,25 @@ struct MIDIActivity: Identifiable, Equatable, Sendable {
 
     /// How the message reads in the Activity Log.
     var logMessage: String {
-        "\(kind.displayName) \(byte1)"
+        "\(kind.displayName) \(kind.describeByte1(byte1))"
     }
 
     var logDetails: String {
-        kind == .programChange
-            ? "Channel \(channel + 1)  ·  Program \(byte1)"
-            : "Channel \(channel + 1)  ·  Byte 1 \(byte1)  ·  Byte 2 \(byte2)"
+        var parts = ["Channel \(channel + 1)", "\(kind.byte1Title) \(kind.describeByte1(byte1))"]
+        if let byte2Title = kind.byte2Title {
+            parts.append("\(byte2Title) \(byte2)")
+        }
+        return parts.joined(separator: "  ·  ")
+    }
+}
+
+/// Note names with middle C (note 60) as C3, the convention Logic Pro and GarageBand use.
+nonisolated enum MIDINoteName {
+    private static let pitchClasses = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"]
+
+    static func name(for note: UInt8) -> String {
+        let octave = Int(note) / 12 - 2
+        return "\(pitchClasses[Int(note) % 12])\(octave)"
     }
 }
 
@@ -192,12 +232,6 @@ final class MIDIController: @unchecked Sendable {
         }
     }
 
-    var programChangeOffset: Int {
-        didSet {
-            defaults.set(programChangeOffset, forKey: Keys.programOffset)
-        }
-    }
-
     private(set) var sources: [MIDIInputSource] = []
     private(set) var bindings: [MIDINavigationAction: MIDITrigger] = [:]
     private(set) var learningAction: MIDINavigationAction?
@@ -221,7 +255,6 @@ final class MIDIController: @unchecked Sendable {
         acceptsAllSources = defaults.object(forKey: Keys.acceptsAllSources) as? Bool ?? true
         selectedSourceIDs = Set((defaults.array(forKey: Keys.selectedSourceIDs) as? [NSNumber] ?? []).map(\.int32Value))
         programChangeRecallEnabled = defaults.bool(forKey: Keys.programRecall)
-        programChangeOffset = defaults.object(forKey: Keys.programOffset) as? Int ?? 1
         loadBindings()
         if connectsToDevices { setup() }
     }
@@ -444,15 +477,11 @@ final class MIDIController: @unchecked Sendable {
         }
 
         if programChangeRecallEnabled, activity.kind == .programChange {
-            let page = Int(activity.byte1) + programChangeOffset
-            guard page > 0 else {
-                record(activity, status: .invalid(
-                    "Program \(activity.byte1) with offset \(programChangeOffset) is page \(page)"
-                ))
-                return
-            }
-            record(activity, status: .triggered(ViewtifulAction.goToPage(page).title))
-            onAction?(.goToPage(page))
+            // Program values run from 0 on the wire, so Program 0 recalls page 1. Pages
+            // are numbered as the document numbers them, the same as OSC page cues.
+            let action = ViewtifulAction.goToLabeledPage(Int(activity.byte1) + 1)
+            record(activity, status: .triggered(action.title))
+            onAction?(action)
             return
         }
 
@@ -567,7 +596,6 @@ final class MIDIController: @unchecked Sendable {
         static let acceptsAllSources = "midi.acceptsAllSources"
         static let selectedSourceIDs = "midi.selectedSourceIDs"
         static let programRecall = "midi.programRecall"
-        static let programOffset = "midi.programOffset"
         static let bindings = "midi.bindings"
     }
 }

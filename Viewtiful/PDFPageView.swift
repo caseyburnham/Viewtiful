@@ -1,67 +1,62 @@
-import ObjectiveC
 import PDFKit
 import SwiftUI
 
 #if os(macOS)
 struct PDFPageView: NSViewRepresentable {
-    let document: PDFDocument
+    let document: ShowDocument
     let pageIndex: Int
     let invertColors: Bool
     let invertAnnotations: Bool
     /// Fills the space the fitted page does not cover with paper rather than window
     /// chrome, so a margin around the page looks like the page's own border.
     let usesPaperBackground: Bool
+    /// How far a swipe in progress has carried the page.
+    let dragOffset: CGFloat
+    let reduceMotion: Bool
     let onPageTurn: (ViewtifulAction) -> Void
-    let onGoToPage: () -> Void
 
     func makeNSView(context: Context) -> ShowPDFView {
         let view = ShowPDFView()
         configure(view)
         view.onPageTurn = onPageTurn
-        view.onGoToPage = onGoToPage
-        update(view, cache: context.coordinator)
+        update(view, warmer: context.coordinator)
         return view
     }
 
     func updateNSView(_ view: ShowPDFView, context: Context) {
         view.onPageTurn = onPageTurn
-        view.onGoToPage = onGoToPage
         if context.coordinator.source !== document { view.needsWindowFit = true }
-        update(view, cache: context.coordinator)
+        update(view, warmer: context.coordinator)
         view.fitWindowIfNeeded()
+    }
+
+    /// The window only keeps the page's shape while there is a page to keep.
+    static func dismantleNSView(_ view: ShowPDFView, coordinator: PageWarmer) {
+        view.releaseWindowShape()
     }
 }
 
 /// PDFKit owns rendering and accessibility. The show viewer owns page navigation.
-final class ShowPDFView: PDFView, PDFViewDelegate {
-    /// PDFKit builds a page's annotation layers a frame or two after laying the page
-    /// out, so a sweep has to outlast that without running indefinitely.
-    private static let annotationSweepFrames = 30
-    /// Once a sweep has corrected something the layers exist, so only a couple more
-    /// frames are needed to catch any arriving in the same batch.
-    private static let annotationSweepSettleFrames = 2
-    private static let windowFitDuration = 0.2
-
+final class ShowPDFView: PDFView, PDFViewDelegate, PageTurnHosting {
     var onPageTurn: ((ViewtifulAction) -> Void)?
-    var onGoToPage: (() -> Void)?
     var needsWindowFit = true
+    let pageTurnAnimator = PageTurnAnimator()
+    var pageContentLayer: CALayer? { firstScrollView(in: self)?.layer }
+    var pageHostLayer: CALayer? { layer }
     private var scrollNavigation = ScrollPageNavigation()
-    private var pendingAnnotationScaleFrames = 0
-    private var annotationSweepLink: CADisplayLink?
-    /// What the last sweep was scheduled for. A layout that changes neither leaves
-    /// the annotation layers alone.
-    private var sweptScale: CGFloat = 0
-    private weak var sweptPage: PDFPage?
     private var isWindowFitScheduled = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         delegate = self
+        // Page turns animate the view's layer, so it needs one of its own.
+        wantsLayer = true
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         delegate = self
+        wantsLayer = true
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
@@ -71,25 +66,31 @@ final class ShowPDFView: PDFView, PDFViewDelegate {
 
     override var acceptsFirstResponder: Bool { true }
 
+    /// Go to Page (⌘L) is left to its menu item, which handles it before this view sees it.
     override func keyDown(with event: NSEvent) {
         guard !event.isARepeat else { return }
-        if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers == "l" {
-            onGoToPage?()
-            return
-        }
         guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty else {
             super.keyDown(with: event)
             return
         }
-        switch event.keyCode {
-        case 124, 121: onPageTurn?(.nextPage)
-        case 123, 116: onPageTurn?(.previousPage)
-        case 49: onPageTurn?(event.modifierFlags.contains(.shift) ? .previousPage : .nextPage)
-        case 115: onPageTurn?(.firstPage)
-        case 119: onPageTurn?(.lastPage)
-        case 53: break
-        default: super.keyDown(with: event)
+        if let action = Self.pageAction(for: event) {
+            onPageTurn?(action)
+        } else if event.charactersIgnoringModifiers != "\u{1B}" {
+            // Escape is swallowed so that dismissing nothing doesn't beep mid-show.
+            super.keyDown(with: event)
         }
+    }
+
+    private static func pageAction(for event: NSEvent) -> ViewtifulAction? {
+        switch event.specialKey {
+        case .rightArrow?, .pageDown?: return .nextPage
+        case .leftArrow?, .pageUp?: return .previousPage
+        case .home?: return .firstPage
+        case .end?: return .lastPage
+        default: break
+        }
+        guard event.charactersIgnoringModifiers == " " else { return nil }
+        return event.modifierFlags.contains(.shift) ? .previousPage : .nextPage
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -135,12 +136,7 @@ final class ShowPDFView: PDFView, PDFViewDelegate {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        guard window != nil else {
-            // The sweep's display link retains this view, so a document that closes
-            // mid-sweep would otherwise stay alive redrawing layers nobody can see.
-            stopAnnotationSweep()
-            return
-        }
+        guard window != nil else { return }
         // Wait for SwiftUI to lay out the document viewport before sizing its window.
         scheduleWindowFit()
     }
@@ -178,104 +174,6 @@ final class ShowPDFView: PDFView, PDFViewDelegate {
         // PDFKit reserves the titlebar's space again as it lays the page out.
         clearContentInsets()
         scheduleWindowFit()
-        // Only a new page or a new scale can leave an annotation layer rasterized at
-        // the wrong resolution. Layouts that change neither — insets being re-cleared,
-        // the toolbar coming and going — would otherwise restart half a second of
-        // layer-tree walking every time they ran, which during a live resize is every
-        // frame. Checking the page here also covers a page delivered asynchronously,
-        // which never passes back through `updateNSView`.
-        if annotationLayerScale != sweptScale || currentPage !== sweptPage {
-            scheduleAnnotationLayerScaleFix()
-        }
-    }
-
-    override func viewDidChangeBackingProperties() {
-        super.viewDidChangeBackingProperties()
-        scheduleAnnotationLayerScaleFix()
-    }
-
-    // MARK: - Annotation layer resolution
-
-    /// PDFKit gives each page tile a contentsScale of the view's scale times the
-    /// screen's backing scale, but builds a layer per annotation and leaves those
-    /// at 1.0. Ink and shape markup is then rasterized at a fifth of the page's
-    /// resolution and upscaled, so it looks blocky next to crisp page text.
-    ///
-    /// Those layers are built inside PDFKit's own transaction a frame or two
-    /// after the page is laid out, so there is no view callback that lands once
-    /// they exist. Sweep for them over the next few frames instead, and stop as
-    /// soon as a sweep has corrected some and a couple of frames have settled.
-    private func scheduleAnnotationLayerScaleFix() {
-        sweptScale = annotationLayerScale
-        sweptPage = currentPage
-        pendingAnnotationScaleFrames = Self.annotationSweepFrames
-        startAnnotationSweep()
-    }
-
-    private func startAnnotationSweep() {
-        guard annotationSweepLink == nil, window != nil else { return }
-        // The layers being corrected are composited by Core Animation, so there is
-        // nothing to gain from looking for them more often than the screen redraws.
-        let link = displayLink(target: self, selector: #selector(runAnnotationScalePass))
-        link.add(to: .main, forMode: .common)
-        annotationSweepLink = link
-    }
-
-    private func stopAnnotationSweep() {
-        pendingAnnotationScaleFrames = 0
-        annotationSweepLink?.invalidate()
-        annotationSweepLink = nil
-    }
-
-    @objc private func runAnnotationScalePass() {
-        guard pendingAnnotationScaleFrames > 0 else {
-            stopAnnotationSweep()
-            return
-        }
-        pendingAnnotationScaleFrames -= 1
-        if matchAnnotationLayerScale() > 0 {
-            pendingAnnotationScaleFrames = min(pendingAnnotationScaleFrames,
-                                               Self.annotationSweepSettleFrames)
-        }
-        if pendingAnnotationScaleFrames == 0 { stopAnnotationSweep() }
-    }
-
-    /// The resolution PDFKit should be rasterizing this page's annotations at.
-    private var annotationLayerScale: CGFloat {
-        guard let window else { return 0 }
-        let scale = scaleFactor * window.backingScaleFactor
-        return scale > 0 && scale.isFinite ? scale : 0
-    }
-
-    /// Returns how many layers needed correcting, so the sweep knows when the
-    /// page's annotation layers have shown up.
-    @discardableResult
-    private func matchAnnotationLayerScale() -> Int {
-        guard let root = layer else { return 0 }
-        let scale = annotationLayerScale
-        guard scale > 0 else { return 0 }
-        return applyAnnotationScale(scale, to: root, insideAnnotation: false)
-    }
-
-    private func applyAnnotationScale(_ scale: CGFloat, to layer: CALayer, insideAnnotation: Bool) -> Int {
-        var corrected = 0
-        let isAnnotation = insideAnnotation || Self.isAnnotationLayer(layer)
-        if isAnnotation, layer.contentsScale != scale {
-            layer.contentsScale = scale
-            layer.setNeedsDisplay()
-            corrected += 1
-        }
-        for sublayer in layer.sublayers ?? [] {
-            corrected += applyAnnotationScale(scale, to: sublayer, insideAnnotation: isAnnotation)
-        }
-        return corrected
-    }
-
-    /// PDFKit's annotation layers are private types, so they are recognised by name.
-    /// `String(describing:)` would allocate a string for every layer on every frame
-    /// of the sweep; the class name is already a C string and is searched in place.
-    private static func isAnnotationLayer(_ layer: CALayer) -> Bool {
-        strstr(class_getName(type(of: layer)), "Annotation") != nil
     }
 
     // MARK: - Window fit
@@ -293,60 +191,67 @@ final class ShowPDFView: PDFView, PDFViewDelegate {
         }
     }
 
+    /// Gives the window the page's shape and holds it there, so resizing the window
+    /// scales the page rather than opening bars beside it. The window keeps its height
+    /// and center and only its width changes, once, when a document is opened.
     func fitWindowIfNeeded() {
-        guard needsWindowFit, bounds.height > 0, let window,
-              let page = currentPage, let screen = window.screen else { return }
+        guard needsWindowFit, bounds.height > 0, let window, let page = currentPage else { return }
         needsWindowFit = false
-        guard !window.styleMask.contains(.fullScreen), !window.isZoomed else { return }
         var pageSize = page.bounds(for: .cropBox).size
         if abs(page.rotation) % 180 == 90 { swap(&pageSize.width, &pageSize.height) }
         guard pageSize.width > 0, pageSize.height > 0 else { return }
-        let horizontalChrome = max(0, window.frame.width - bounds.width)
-        let width = min(screen.visibleFrame.width, max(window.minSize.width, bounds.height * pageSize.width / pageSize.height + horizontalChrome))
-        var frame = window.frame
-        frame.origin.x += (frame.width - width) / 2
-        frame.size.width = width
-        frame.origin.x = min(max(frame.minX, screen.visibleFrame.minX), screen.visibleFrame.maxX - width)
-        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
-            window.setFrame(frame, display: true)
-            return
-        }
-        // `setFrame(_:display:animate:)` runs its animation by blocking the main
-        // thread, stalling the document's first layout behind it for the duration.
-        // The animator proxy gives the same movement without holding anything up.
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = Self.windowFitDuration
-            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            window.animator().setFrame(frame, display: true)
-        }
+
+        window.contentAspectRatio = pageSize
+        guard !window.styleMask.contains(.fullScreen), !window.isZoomed,
+              let visible = window.screen?.visibleFrame else { return }
+
+        var content = window.contentRect(forFrameRect: window.frame)
+        let width = content.height * pageSize.width / pageSize.height
+        content.origin.x += (content.width - width) / 2
+        content.size.width = width
+        var frame = window.frameRect(forContentRect: content)
+        frame.size.width = min(max(frame.width, window.minSize.width), visible.width)
+        frame.origin.x = min(max(frame.minX, visible.minX), visible.maxX - frame.width)
+        window.setFrame(frame, display: true)
+    }
+
+    /// Returns the window to free resizing once no page is being shown.
+    func releaseWindowShape() {
+        window?.contentResizeIncrements = NSSize(width: 1, height: 1)
     }
 }
 #else
 struct PDFPageView: UIViewRepresentable {
-    let document: PDFDocument
+    let document: ShowDocument
     let pageIndex: Int
     let invertColors: Bool
     let invertAnnotations: Bool
     /// Fills the space the fitted page does not cover with paper rather than window
     /// chrome, so a margin around the page looks like the page's own border.
     let usesPaperBackground: Bool
+    /// How far a swipe in progress has carried the page.
+    let dragOffset: CGFloat
+    let reduceMotion: Bool
     let onPageTurn: (ViewtifulAction) -> Void
-    let onGoToPage: () -> Void
 
     func makeUIView(context: Context) -> FitPDFView {
         let view = FitPDFView()
         configure(view)
-        update(view, cache: context.coordinator)
+        update(view, warmer: context.coordinator)
         return view
     }
 
     func updateUIView(_ view: FitPDFView, context: Context) {
-        update(view, cache: context.coordinator)
+        update(view, warmer: context.coordinator)
     }
 }
 
 /// Zooming is off: the page is always drawn at the largest scale that fits the view.
-final class FitPDFView: PDFView, PDFViewDelegate {
+final class FitPDFView: PDFView, PDFViewDelegate, PageTurnHosting {
+    let pageTurnAnimator = PageTurnAnimator()
+    var pageContentLayer: CALayer? { contentScrollView?.layer }
+    var pageHostLayer: CALayer? { layer }
+
     /// Walk from PDFKit's public document view to its containing scroll view.
     var contentScrollView: UIScrollView? {
         var ancestor = documentView?.superview
@@ -423,7 +328,7 @@ final class FitPDFView: PDFView, PDFViewDelegate {
 #endif
 
 extension PDFPageView {
-    func makeCoordinator() -> PDFDisplayCache { PDFDisplayCache() }
+    func makeCoordinator() -> PageWarmer { PageWarmer() }
 
     func configure(_ view: PDFView) {
         view.displayMode = .singlePage
@@ -439,7 +344,7 @@ extension PDFPageView {
     /// to do with the page — a toolbar fading in, the pointer moving. Every assignment
     /// here is therefore guarded: PDFKit relays out the document and redraws the page
     /// when these are set, even when set to the value they already hold.
-    func update(_ view: PDFView, cache: PDFDisplayCache) {
+    func update(_ view: any PageTurnHosting, warmer: PageWarmer) {
         if view.pageShadowsEnabled { view.pageShadowsEnabled = false }
         // Paper white and black are fixed rather than dynamic: they have to match the
         // page PDFKit is drawing, not the system's current appearance.
@@ -454,27 +359,38 @@ extension PDFPageView {
         #endif
         if view.backgroundColor != background { view.backgroundColor = background }
 
-        // An inverted page that has not been built yet arrives here rather than
-        // holding up the turn. Until it does the view keeps the page it is already
-        // showing, which is a better thing to look at than a half-drawn one.
-        cache.onPageReady = { [weak view] displayed, index in
-            guard let view else { return }
-            show(displayed, pageIndex: index, in: view)
+        // Set before any turn, so the incoming page is drawn in the new colors from
+        // its first tile.
+        let appearance = PageAppearance(inverted: invertColors, invertAnnotations: invertAnnotations)
+        let appearanceChanged = document.appearance != appearance
+        if appearanceChanged { document.appearance = appearance }
+
+        if view.document !== document {
+            view.document = document
+        } else if appearanceChanged, let shown = view.currentPage {
+            // PDFKit keeps a page's tiles for as long as the view holds its document,
+            // and nothing public tells it the page now draws differently. Handing it
+            // the document again rebuilds them; the crossfade covers the swap.
+            view.pageTurnAnimator.crossfade(in: view) {
+                view.document = nil
+                view.document = document
+                view.go(to: shown)
+            }
         }
-        if let target = cache.target(source: document, pageIndex: pageIndex,
-                                     inverted: invertColors, invertAnnotations: invertAnnotations) {
-            show(target.document, pageIndex: target.pageIndex, in: view)
+        if let page = document.page(at: pageIndex), view.currentPage !== page {
+            view.pageTurnAnimator.turn(to: pageIndex, of: document, reduceMotion: reduceMotion, in: view) {
+                view.go(to: page)
+            }
         }
+        warmer.warm(around: pageIndex, in: document)
+
+        // After any turn, so a release that turned the page hands its offset to the
+        // turn rather than springing back first.
+        view.pageTurnAnimator.follow(dragOffset: dragOffset, reduceMotion: reduceMotion, in: view)
 
         // The page always scales to the window; there is no manual zoom to preserve.
         // Assigning this rescales the page, so it is only restored if something
         // actually turned it off.
         if !view.autoScales { view.autoScales = true }
-    }
-
-    private func show(_ displayed: PDFDocument, pageIndex: Int, in view: PDFView) {
-        if view.document !== displayed { view.document = displayed }
-        guard let page = displayed.page(at: pageIndex), view.currentPage !== page else { return }
-        view.go(to: page)
     }
 }

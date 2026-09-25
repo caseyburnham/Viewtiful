@@ -25,6 +25,13 @@ struct ContentView: View {
     @State private var controlsAutoHideTask: Task<Void, Never>?
     @State private var pageEntry = ""
     @FocusState private var pageEntryFocused: Bool
+    /// How far a swipe has carried the page, which it follows until released.
+    @State private var dragOffset: CGFloat = 0
+    @State private var viewerWidth: CGFloat = 0
+    /// The page under the scrubber while it is held, in PDF order from 0. The page
+    /// itself only changes on release, so a long scrub never queues a page render
+    /// for every page it passes.
+    @State private var scrubbedPageIndex: Double?
 
     var body: some View {
         navigation
@@ -51,7 +58,7 @@ struct ContentView: View {
         }
         // Handed a PDF by Files or the Finder, Viewtiful opens it like any other show.
         .onOpenURL { model.openDocument(at: $0) }
-        .alert("Unable to Complete Action", isPresented: Binding(
+        .alert("Couldn’t Open Document", isPresented: Binding(
             get: { model.presentedError != nil },
             set: { if !$0 { model.clearPresentedError() } }
         )) {
@@ -67,6 +74,7 @@ struct ContentView: View {
             recentDocuments: model.recentDocuments,
             openRecentDocument: model.openRecentDocument,
             clearRecentDocuments: model.clearRecentDocuments,
+            closeDocument: model.closeDocument,
             showActivityLog: showActivityLog,
             goToPage: showPageEntry,
             controlsVisible: controlsVisible,
@@ -119,6 +127,7 @@ struct ContentView: View {
         .toolbarBackgroundVisibility(controlsVisible ? .automatic : .hidden, for: .windowToolbar)
         .background {
             TitlebarConfigurator()
+            FullScreenPointerHiding(isEnabled: model.hasDocument)
             ToolbarHoverMonitor { isHovering in
                 isToolbarHovering = isHovering
                 if isHovering {
@@ -162,7 +171,7 @@ struct ContentView: View {
             documentNavigation
                 .task(id: url) { model.openDocument(at: url) }
         }
-        //.documentLaunchSubtitle("xxx")
+        .documentLaunchSubtitle("Open a PDF script to follow during the show.")
     }
     #endif
 
@@ -198,8 +207,9 @@ struct ContentView: View {
                     PDFPageView(document: document, pageIndex: model.currentPageIndex,
                                 invertColors: model.invertPDFColors, invertAnnotations: model.invertAnnotations,
                                 usesPaperBackground: usesPaperBackground,
-                                onPageTurn: turnPage,
-                                onGoToPage: showPageEntry)
+                                dragOffset: dragOffset,
+                                reduceMotion: reduceMotion,
+                                onPageTurn: turnPage)
                         .padding(marginInset(in: proxy.size))
                         .accessibilityLabel("\(model.documentName), page \(model.displayedPageNumber) of \(model.lastPageNumber)")
                         // The margin carries no view of its own, so the tap target has
@@ -213,14 +223,17 @@ struct ContentView: View {
                         )
                 } else {
                     // The Mac has no document launcher scene, so this stands in for it with
-                    // the same two choices the iOS launch card offers.
+                    // the same choices the iOS launch card offers, plus the recent shows.
                     ContentUnavailableView {
                         Label("Open a Show Document", systemImage: "doc.richtext")
+                    } description: {
+                        Text("Open a PDF script to follow during the show. Viewtiful reads it where it is and remembers your page.")
                     } actions: {
-                        Button("Open Document", systemImage: "folder") { isChoosingDocument = true }
+                        Button("Open Document…", systemImage: "folder") { isChoosingDocument = true }
                             .buttonStyle(.borderedProminent)
-                        if model.canOpenLastDocument {
-                            Button("Open Last", systemImage: "clock.arrow.circlepath") { model.openLastDocument() }
+                        if !model.recentDocuments.isEmpty {
+                            RecentDocumentsLauncher(documents: model.recentDocuments,
+                                                    open: model.openRecentDocument)
                         }
                     }
                 }
@@ -228,6 +241,7 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { viewerWidth = $0 }
         // Fit the document to the whole viewport, including the area beneath controls.
         #if os(macOS)
         .ignoresSafeArea(edges: .top)
@@ -236,10 +250,7 @@ struct ContentView: View {
         #endif
         // Keep a slim edge free of app gestures so the system resize target remains easy to reach.
         .contentShape(Rectangle().inset(by: 8))
-        .gesture(DragGesture(minimumDistance: 40).onEnded { value in
-            guard abs(value.translation.width) > abs(value.translation.height) else { return }
-            turnPage(value.translation.width < 0 ? .nextPage : .previousPage)
-        })
+        .gesture(pageSwipe)
         .focusable()
         .focusEffectDisabled()
         .onKeyPress(phases: .down) { key in
@@ -266,6 +277,31 @@ struct ContentView: View {
                     .transition(reduceMotion ? .identity : .opacity)
             }
         }
+    }
+
+    /// The page follows the finger, then either turns or settles back when released.
+    /// A flick counts as much as a long drag, since the predicted end is what's judged.
+    private var pageSwipe: some Gesture {
+        DragGesture(minimumDistance: 12)
+            .onChanged { value in
+                guard model.hasDocument else { return }
+                let translation = value.translation
+                // Only a mostly horizontal drag starts tracking, but once it has, the
+                // page stays with the finger however the drag wanders.
+                guard dragOffset != 0 || abs(translation.width) > abs(translation.height) else { return }
+                let action: ViewtifulAction = translation.width < 0 ? .nextPage : .previousPage
+                // With nowhere to turn to, the page resists rather than following freely.
+                dragOffset = model.canPerform(action) ? translation.width : translation.width / 4
+            }
+            .onEnded { value in
+                let offset = dragOffset
+                dragOffset = 0
+                guard offset != 0 else { return }
+                let projected = value.predictedEndTranslation.width
+                let threshold = max(60, viewerWidth * 0.2)
+                guard abs(projected) > threshold, (projected < 0) == (offset < 0) else { return }
+                turnPage(offset < 0 ? .nextPage : .previousPage)
+            }
     }
 
     private var controlsAnimation: Animation? {
@@ -332,7 +368,7 @@ struct ContentView: View {
         ToolbarItem(placement: .primaryAction) {
             Button("Activity Log", systemImage: "waveform.path.ecg", action: showActivityLog)
                 .buttonBorderShape(.circle)
-                .help("Open the MIDI and OSC activity log (Command-Shift-M)")
+                .help("Open the MIDI and OSC activity log (⇧⌘M)")
                 .fadesWithControls(controlsVisible, animation: controlsAnimation)
         }
         ToolbarSpacer(.fixed)
@@ -351,43 +387,87 @@ struct ContentView: View {
     }
 
     private var pageNavigationControls: some View {
-        GlassEffectContainer(spacing: 12) {
-            HStack(spacing: 12) {
-                Button("Previous Page", systemImage: "chevron.left") { turnPage(.previousPage) }
-                    .labelStyle(.iconOnly)
-                    .buttonBorderShape(.circle)
-                    .help("Previous page (Left Arrow)")
-
-                Button(action: showPageEntry) {
-                    Text(pageReadout)
-                        .monospacedDigit()
-                        .frame(minWidth: 80)
+        GlassEffectContainer(spacing: ShowControlDesignTokens.regularSpacing) {
+            VStack(spacing: ShowControlDesignTokens.regularSpacing) {
+                if model.pageCount > 1 {
+                    pageScrubber
                 }
-                .buttonBorderShape(.capsule)
-                .accessibilityLabel("Go to Page")
-                .accessibilityValue(pageReadout)
-                .help("Go to a page (⌘L)")
-                .modifier(PageEntryPresentation(
-                    isPresented: $isShowingPageEntry,
-                    pageEntry: $pageEntry,
-                    pageEntryFocused: $pageEntryFocused,
-                    prompt: pageEntryPrompt,
-                    isValidPage: isValidPage,
-                    jumpToPage: jumpToPage
-                ))
-
-                Button("Next Page", systemImage: "chevron.right") { turnPage(.nextPage) }
-                    .labelStyle(.iconOnly)
-                    .buttonBorderShape(.circle)
-                    .help("Next page (Right Arrow or Space)")
+                pageStepControls
             }
             .buttonStyle(.glass)
             .controlSize(.large)
         }
     }
 
+    private var pageStepControls: some View {
+        HStack(spacing: ShowControlDesignTokens.regularSpacing) {
+            Button("Previous Page", systemImage: "chevron.left") { turnPage(.previousPage) }
+                .labelStyle(.iconOnly)
+                .buttonBorderShape(.circle)
+                .help("Previous page (Left Arrow)")
+
+            Button(action: showPageEntry) {
+                Text(pageReadout)
+                    .monospacedDigit()
+                    .frame(minWidth: 80)
+            }
+            .buttonBorderShape(.capsule)
+            .accessibilityLabel("Go to Page")
+            .accessibilityValue(pageReadout)
+            .help("Go to a page (⌘L)")
+            .modifier(PageEntryPresentation(
+                isPresented: $isShowingPageEntry,
+                pageEntry: $pageEntry,
+                pageEntryFocused: $pageEntryFocused,
+                prompt: pageEntryPrompt,
+                isValidPage: isValidPage,
+                jumpToPage: jumpToPage
+            ))
+
+            Button("Next Page", systemImage: "chevron.right") { turnPage(.nextPage) }
+                .labelStyle(.iconOnly)
+                .buttonBorderShape(.circle)
+                .help("Next page (Right Arrow or Space)")
+        }
+    }
+
+    /// While scrubbing, the readout names the page under the thumb rather than the
+    /// one on screen, so it says where letting go will land.
     private var pageReadout: String {
-        "\(model.displayedPageNumber) of \(model.lastPageNumber)"
+        let page = scrubbedPageIndex.map { Int($0) + model.firstPageNumber } ?? model.displayedPageNumber
+        return "\(page) of \(model.lastPageNumber)"
+    }
+
+    private var pageScrubber: some View {
+        Slider(
+            value: Binding(
+                get: { scrubbedPageIndex ?? Double(model.currentPageIndex) },
+                set: { scrubbedPageIndex = $0.rounded() }
+            ),
+            in: 0...Double(model.pageCount - 1)
+        ) {
+            Text("Page")
+        } onEditingChanged: { isEditing in
+            if isEditing {
+                controlsAutoHideTask?.cancel()
+            } else {
+                commitScrub()
+            }
+        }
+        .labelsHidden()
+        .frame(minWidth: 240, idealWidth: 360, maxWidth: 480)
+        .padding(.horizontal)
+        .padding(.vertical, ShowControlDesignTokens.compactSpacing)
+        .glassEffect(.regular.interactive(), in: .capsule)
+        .accessibilityValue(pageReadout)
+        .help("Drag to choose a page")
+    }
+
+    private func commitScrub() {
+        guard let index = scrubbedPageIndex else { return }
+        scrubbedPageIndex = nil
+        model.perform(.goToPage(Int(index) + 1))
+        recordControlsInteraction()
     }
 
     private var pageEntryPrompt: String {
@@ -414,6 +494,9 @@ struct ContentView: View {
     private func handleDocumentTap(at location: CGPoint, in size: CGSize) {
         guard model.hasDocument else { return }
 
+        // Edge taps are a touch affordance. On the Mac a click anywhere shows or hides
+        // the controls, and the keyboard, trackpad, and buttons turn the page.
+        #if !os(macOS)
         if model.edgeTapNavigationEnabled {
             let edgeWidth = min(max(size.width * 0.15, 56), 160)
             if location.x <= edgeWidth {
@@ -427,6 +510,7 @@ struct ContentView: View {
                 return
             }
         }
+        #endif
 
         toggleControls()
     }
@@ -474,7 +558,7 @@ struct ContentView: View {
             }
 
             guard !Task.isCancelled, controlsVisible, !isShowingPageEntry, !isShowingPageNumbering,
-                  !isToolbarHovering else { return }
+                  !isToolbarHovering, scrubbedPageIndex == nil else { return }
             hideControls()
         }
     }
@@ -653,7 +737,7 @@ private final class DocumentHostingController<Content: View>: UIHostingControlle
             self.pdfScrollView?.topEdgeEffect.isHidden = !visible
         }
         if animated && hasPresentedControls {
-            UIView.animate(withDuration: 0.18, delay: 0,
+            UIView.animate(withDuration: ShowControlMotion.controlsFadeDuration, delay: 0,
                            options: [.beginFromCurrentState, .curveEaseInOut, .allowUserInteraction],
                            animations: changes)
         } else {
@@ -717,6 +801,46 @@ private struct PageEntryPresentation: ViewModifier {
     }
 }
 
+/// The most recent shows, each with the page it will reopen on, so picking up where
+/// the last rehearsal left off takes one click.
+private struct RecentDocumentsLauncher: View {
+    private static let visibleCount = 5
+
+    let documents: [RecentDocument]
+    let open: (RecentDocument) -> Void
+
+    var body: some View {
+        GroupBox {
+            VStack(spacing: 0) {
+                ForEach(documents.prefix(Self.visibleCount)) { recent in
+                    Button { open(recent) } label: {
+                        Label {
+                            VStack(alignment: .leading) {
+                                Text(recent.displayName)
+                                    .foregroundStyle(.primary)
+                                Text("Page \(recent.lastPageIndex + 1 + recent.pageOffset) · \(recent.lastOpened, format: .relative(presentation: .named))")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } icon: {
+                            Image(systemName: "doc.richtext")
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, ShowControlDesignTokens.compactSpacing / 2)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Open “\(recent.displayName)”")
+                }
+            }
+        } label: {
+            Text("Recent")
+        }
+        .frame(maxWidth: 360)
+        .padding(.top)
+    }
+}
+
 private extension View {
     /// The bar's own alpha only reaches what the system draws inside it — its
     /// background and title. Toolbar items are rendered separately and outlive that
@@ -738,6 +862,7 @@ struct ViewerCommandActions {
     let recentDocuments: [RecentDocument]
     let openRecentDocument: (RecentDocument) -> Void
     let clearRecentDocuments: () -> Void
+    let closeDocument: () -> Void
     let showActivityLog: () -> Void
     let goToPage: () -> Void
     let controlsVisible: Bool
@@ -787,6 +912,14 @@ struct ViewerCommands: Commands {
                 Button("Clear Menu") { viewer?.clearRecentDocuments() }
             }
             .disabled(viewer?.recentDocuments.isEmpty != false)
+
+            Divider()
+
+            // ⌘W stays with the window, which quits Viewtiful. Closing the document
+            // instead returns to the launcher and keeps the app running.
+            Button("Close Document") { viewer?.closeDocument() }
+                .keyboardShortcut("w", modifiers: [.command, .shift])
+                .disabled(viewer?.hasDocument != true)
         }
         CommandMenu("Page") {
             Group {
